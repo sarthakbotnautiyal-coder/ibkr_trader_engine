@@ -1,1 +1,1 @@
-"""IBKR Trader Engine - SPX 0DTE trading system."""
+"""SPX 0DTE Auto-Trader Engine — src package."""
