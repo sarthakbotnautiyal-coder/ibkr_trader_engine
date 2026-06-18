@@ -1,0 +1,75 @@
+# IBKR Trader Engine Configuration
+# See plan document for detailed parameter descriptions
+
+ibkr:
+  host: "127.0.0.1"
+  port: 7497        # 4001 for live, 7497 for paper
+  scanner_client_id: 15
+  spot_client_id: 16
+  engine_client_id: 31
+  account_id: "U13498586"
+  use_margin_limit: true
+
+market:
+  entry_start: "09:00"
+  entry_end: "16:00"
+
+paths:
+  logs: "logs"
+
+# Data source paths (relative to engine root directory)
+data_sources:
+  gex_db: "../gex_extractor/data/gex.db"
+  scanner_db: "../premium_extractor/data/scanner.db"
+  tradingview_db: "../tradingView_signal_generator/data/tradingview.db"
+
+entry:
+  spread_width_primary: 10
+  spread_width_fallback: 20
+  short_delta_target: 0.03
+  contracts_per_trade: 1
+  vix_buckets:
+    13-16:
+      min_premium: 0.20
+      rsi_upper_threshold: 50.0
+      rsi_lower_threshold: 49.0
+      distance:
+        from_spot: 3
+        from_gex_level: 1
+    16-20:
+      min_premium: 0.25
+      rsi_upper_threshold: 55.0
+      rsi_lower_threshold: 45.0
+      distance:
+        from_spot: 3
+        from_gex_level: 1.5
+    20-25:
+      min_premium: 0.30
+      rsi_upper_threshold: 55.0
+      rsi_lower_threshold: 45.0
+      distance:
+        from_spot: 3
+        from_gex_level: 1.5
+    25-30:
+      min_premium: 0.35
+      rsi_upper_threshold: 55.0
+      rsi_lower_threshold: 45.0
+      distance:
+        from_spot: 3.0
+        from_gex_level: 1.5
+
+day_gate:
+  enabled: true
+  window_minutes: 15
+  gex_by_oi_threshold: 0.0
+  spot_zero_gamma_threshold: -15.0
+  rsi_extreme_low: 15.0
+  rsi_extreme_high: 85.0
+
+engine:
+  check_interval_seconds: 30
+
+telegram:
+  dry_run: false
+
+dry_run: false
