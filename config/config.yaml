@@ -1,6 +1,11 @@
 # IBKR Trader Engine Configuration
 # See plan document for detailed parameter descriptions
 
+# Data source configuration (LOCAL or CLOUD)
+data_source_mode: "local"        # "local" (primary) or "cloud" (Supabase)
+supabase_app_id: ""              # Required if data_source_mode: "cloud"
+                                 # Each user gets unique read-only key from Supabase
+
 ibkr:
   host: "127.0.0.1"
   port: 7497        # 4001 for live, 7497 for paper
@@ -73,3 +78,9 @@ telegram:
   dry_run: false
 
 dry_run: false
+
+# Backtesting configuration (LOCAL data source only)
+backtesting:
+  enabled: false               # Enable backtesting mode
+  backtest_date: ""            # Format: "YYYY-MM-DD" (single date, not range)
+  db_path: "data/backtests.db" # Separate DB for backtest results
