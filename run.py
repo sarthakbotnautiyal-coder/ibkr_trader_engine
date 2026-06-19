@@ -68,11 +68,15 @@ def _smoke_test():
 
 
 def _run_backtest(backtest_date: str):
-    """Run backtest for a specific date (LOCAL mode only)."""
+    """Run a backtest for a specific date via the REAL engine (LOCAL mode only).
+
+    The engine runs in backtest mode: same tick()/decision logic as live, fills
+    at scan mid (DRY_RUN path), writing to an isolated per-run positions DB.
+    """
     print(f"\n=== Backtesting {backtest_date} ===\n")
 
     from src.data_sources import verify_data_source, check_backtesting_compatibility
-    from src.backtests_db import init_backtests_db, create_backtest, finalize_backtest
+    from src.backtests_db import init_registry, create_run, finalize_run
 
     try:
         verify_data_source()
@@ -81,25 +85,30 @@ def _run_backtest(backtest_date: str):
         print(f"❌ Configuration error: {e}")
         sys.exit(1)
 
-    init_backtests_db()
-    backtest_id = create_backtest(backtest_date)
+    init_registry()
+    run_id, db_path = create_run(backtest_date)
+    print(f"Backtest run #{run_id} → {db_path}\n")
 
     try:
-        # Import backtest executor
-        from src.backtest_executor import BacktestExecutor
+        from src.engine import AutoTraderEngine
 
-        executor = BacktestExecutor(backtest_id=backtest_id, backtest_date=backtest_date)
-        stats = executor.run()
+        engine = AutoTraderEngine(
+            mode="backtest",
+            backtest_date=backtest_date,
+            store_db_path=str(db_path),
+        )
+        ticks = engine.run_backtest(backtest_date)
+        stats = finalize_run(run_id, db_path, ticks)
 
-        print(f"\n=== Backtest #{backtest_id} Results ===")
-        print(f"Date: {backtest_date}")
-        print(f"Total Signals: {stats.get('total_signals', 0)}")
-        print(f"Total Trades: {stats.get('total_trades', 0)}")
-        print(f"Winning Trades: {stats.get('winning_trades', 0)}")
-        print(f"Losing Trades: {stats.get('losing_trades', 0)}")
-        print(f"Win Rate: {stats.get('win_rate', 0):.1f}%")
-        print(f"Total P&L: {stats.get('total_pnl', 0):.2f}")
-        print(f"Avg P&L/Trade: {stats.get('avg_pnl_per_trade', 0):.2f}")
+        print(f"\n=== Backtest #{run_id} Results ({backtest_date}) ===")
+        print(f"Ticks replayed:    {stats.get('ticks', 0)}")
+        print(f"Signals recorded:  {stats.get('total_signals', 0)}")
+        print(f"Positions opened:  {stats.get('total_positions', 0)}")
+        print(f"  - still open:    {stats.get('open_positions', 0)}")
+        print(f"  - closed:        {stats.get('closed_positions', 0)}")
+        print(f"Winning / Losing:  {stats.get('winning', 0)} / {stats.get('losing', 0)}")
+        print(f"Total P&L:         {stats.get('total_pnl', 0):.2f}")
+        print(f"\nIsolated DB: {db_path}")
         print()
 
     except Exception as e:

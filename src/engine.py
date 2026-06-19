@@ -98,6 +98,9 @@ class AutoTraderEngine:
     def __init__(
         self,
         check_interval: Optional[int] = None,
+        mode: str = "local",
+        backtest_date: Optional[str] = None,
+        store_db_path: Optional[str] = None,
     ):
         from position_store import PositionStore
 
@@ -106,10 +109,28 @@ class AutoTraderEngine:
             if check_interval is not None
             else CONFIG["engine"]["check_interval_seconds"]
         )
-        self.dry_run: bool = DRY_RUN
+
+        # Run mode: "local" | "cloud" | "backtest".
+        #   - local/cloud share the live path (real IBKR client, real-time loop)
+        #     and differ ONLY in data source, which is resolved inside
+        #     combined_reader via config data_source_mode. The decision logic
+        #     (tick/process_tick/gates/entry/exit) is identical for both.
+        #   - backtest forces the DRY_RUN fill path (fills at scan mid =
+        #     decision.credit), replays a single historical date, and writes to
+        #     an isolated positions DB. It runs the SAME tick()/process_tick().
+        self.mode = mode
+        self._backtest_date = backtest_date
+        self.dry_run: bool = True if mode == "backtest" else DRY_RUN
         self.logger = _log("engine")
 
-        self.store = PositionStore()
+        # Backtest seams (unused in live/cloud):
+        #   _clock           — parsed timestamp of the snapshot being replayed,
+        #                       so EOD/time logic uses backtest time not wall-clock
+        #   _current_combined — the snapshot tick() consumes this iteration
+        self._clock: Optional[datetime] = None
+        self._current_combined = None
+
+        self.store = PositionStore(db_path=store_db_path)
         self.store.init()
         self.store.load_open()
 
@@ -170,6 +191,35 @@ class AutoTraderEngine:
                 client_id=CONFIG["ibkr"]["engine_client_id"]
             )
         return self._client
+
+    # -------------------------------------------------------------------------
+    # Mode seams — the ONLY behavioral differences between live and backtest.
+    # Everything downstream (process_tick, gates, entry/exit rules) is shared.
+    # -------------------------------------------------------------------------
+
+    def _now(self) -> datetime:
+        """Current time. Live/cloud: wall clock. Backtest: the snapshot's timestamp."""
+        if self.mode == "backtest" and self._clock is not None:
+            return self._clock
+        return datetime.now()
+
+    def _fetch_combined(self):
+        """Fetch the combined snapshot for this tick.
+
+        Live/cloud read the latest scan (as-of joined). Backtest replays the
+        snapshot the run loop set for this iteration. Either way the engine sees
+        an identical CombinedSnapshot and runs identical logic.
+        """
+        if self.mode == "backtest":
+            return self._current_combined
+        from combined_reader import get_combined_for_latest_scan
+        return get_combined_for_latest_scan()
+
+    def _parse_clock(self, ts: str) -> datetime:
+        """Parse a scan timestamp (ISO with offset) into a naive datetime."""
+        from combined_reader import _parse_ts
+        main = _parse_ts(ts).split('.')[0]
+        return datetime.strptime(main, "%Y-%m-%d %H:%M:%S")
 
     def _recover_pending_orders(self) -> None:
         """
@@ -926,6 +976,14 @@ class AutoTraderEngine:
                 num_contracts=num_contracts,
             )
             store._positions.append(pos)
+            # In backtest we set order_time from the backtest clock so the EOD
+            # expiry sweep (which filters on date(order_time)) fires for these
+            # positions and assigns full-credit P&L on worthless 0DTE expiry —
+            # matching LIVE behavior. Live DRY_RUN keeps order_time=None (unchanged).
+            bt_order_time = (
+                self._now().strftime("%Y-%m-%dT%H:%M:%S-04:00")
+                if self.mode == "backtest" else None
+            )
             db_id = store.add_position(
                 pos,
                 em=em,
@@ -935,6 +993,7 @@ class AutoTraderEngine:
                 entry_zero_gamma_dist=None,
                 gex_snapshot=None,
                 spx=spx,
+                order_time=bt_order_time,
             )
             self._log_opened(ts, decision, spx, em)
             self.logger.info(
@@ -1299,7 +1358,9 @@ class AutoTraderEngine:
         """
         from trades_db import get_conn, get_open_positions_for_date, insert_signal
 
-        close_ts = datetime.now().strftime("%Y-%m-%dT16:00:00-0400")
+        # Use the engine clock so backtest stamps the close at the backtest
+        # date's 16:00 (not wall-clock). Live: self._now() == datetime.now().
+        close_ts = self._now().strftime("%Y-%m-%dT16:00:00-0400")
         _conn_kwargs = {"path": _db_path} if _db_path else {}
 
         try:
@@ -1431,10 +1492,10 @@ class AutoTraderEngine:
     # -------------------------------------------------------------------------
 
     def tick(self) -> Optional[str]:
-        from combined_reader import get_combined_for_latest_scan, StaleDataError
+        from combined_reader import StaleDataError
 
         try:
-            combined = get_combined_for_latest_scan()
+            combined = self._fetch_combined()
         except StaleDataError as e:
             ts = "unknown"
             from scanner_reader import get_latest_scan
@@ -1460,8 +1521,11 @@ class AutoTraderEngine:
         # TASK-2026-179: Check for stale pending orders (10-min timeout)
         self._check_pending_timeouts()
 
-        # EOD expiry sweep — once per day after 16:00 ET
-        now_et = datetime.now()
+        # EOD expiry sweep — once per day after 16:00 ET.
+        # Uses self._now() so backtest fires the sweep at the backtest date's
+        # 16:00 (not wall-clock), and writes to the engine's own store DB so
+        # backtest expiries land in the isolated backtest DB.
+        now_et = self._now()
         trade_date = now_et.strftime("%Y-%m-%d")
         if now_et.hour >= 16 and trade_date not in self._eod_expiry_done:
             self._eod_expiry_done.add(trade_date)
@@ -1469,6 +1533,7 @@ class AutoTraderEngine:
                 trade_date=trade_date,
                 spx=spx, em=em, gex_val=gex_val,
                 vix=vix, rsi=rsi,
+                _db_path=self.store.db_path,
             )
 
         # Rolling 30-min volatility gate — blocks new entries, exits always run
@@ -1557,6 +1622,50 @@ class AutoTraderEngine:
             open_strikes=self.store.get_open_strikes(),
             vix=vix,
         )
+
+    # -------------------------------------------------------------------------
+    # Backtest loop — replays a single historical date through the SAME tick()
+    # -------------------------------------------------------------------------
+
+    def run_backtest(self, date_str: str) -> int:
+        """
+        Replay every scan timestamp on `date_str` through the real engine tick().
+
+        Runs in DRY_RUN fill mode (fills at scan mid = decision.credit), writes
+        to this engine's isolated store DB, and uses the backtest clock so the
+        EOD expiry sweep fires at the historical 16:00. Returns the number of
+        ticks replayed.
+        """
+        from combined_reader import iter_combined_for_date
+        import risk_manager
+
+        self.logger.info("=" * 60)
+        self.logger.info(f"BACKTEST START — date={date_str}")
+        self.logger.info(f"Fills: DRY_RUN @ scan mid (decision.credit)")
+        self.logger.info(f"State DB: {self.store.db_path}")
+        self.logger.info("=" * 60)
+
+        # Make market-hours / timestamp gating in the shared decision logic use
+        # the backtest clock instead of wall-clock. self._clock is updated each
+        # tick below, and this lambda reads it lazily.
+        risk_manager.set_clock_override(lambda: self._clock)
+        try:
+            n = 0
+            for combined in iter_combined_for_date(date_str):
+                self._current_combined = combined
+                self._clock = self._parse_clock(combined.scan_timestamp)
+                try:
+                    self.tick()
+                except Exception as e:
+                    self.logger.exception(
+                        f"Backtest tick failed at {combined.scan_timestamp}: {e}"
+                    )
+                n += 1
+        finally:
+            risk_manager.set_clock_override(None)
+
+        self.logger.info(f"BACKTEST COMPLETE — {n} ticks replayed for {date_str}")
+        return n
 
     # -------------------------------------------------------------------------
     # Run loop

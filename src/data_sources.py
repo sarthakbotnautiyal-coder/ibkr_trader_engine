@@ -103,25 +103,31 @@ def check_backtesting_compatibility() -> None:
 # Path resolution helpers
 # ============================================================================
 
+# Engine root (ibkr_trader_engine/). Relative config paths resolve against this,
+# matching combined_reader._resolve so both agree on where the sibling DBs live.
+_ENGINE_ROOT = Path(__file__).parent.parent
+
+
+def _resolve(path_str: str) -> Path:
+    p = Path(path_str)
+    if p.is_absolute():
+        return p
+    return (_ENGINE_ROOT / p).resolve()
+
+
 def _get_gex_db_path() -> Path:
     """Resolve gex_db path from config."""
-    gex_db_path = CONFIG.get("data_sources", {}).get("gex_db", "../gex_extractor/data/gex.db")
-    gex_db = Path(gex_db_path).resolve() if Path(gex_db_path).is_absolute() else Path(__file__).parent.parent.parent / gex_db_path
-    return gex_db
+    return _resolve(CONFIG.get("data_sources", {}).get("gex_db", "../gex_extractor/data/gex.db"))
 
 
 def _get_scanner_db_path() -> Path:
     """Resolve scanner_db path from config."""
-    scanner_db_path = CONFIG.get("data_sources", {}).get("scanner_db", "../premium_extractor/data/scanner.db")
-    scanner_db = Path(scanner_db_path).resolve() if Path(scanner_db_path).is_absolute() else Path(__file__).parent.parent.parent / scanner_db_path
-    return scanner_db
+    return _resolve(CONFIG.get("data_sources", {}).get("scanner_db", "../premium_extractor/data/scanner.db"))
 
 
 def _get_tradingview_db_path() -> Path:
     """Resolve tradingview_db path from config."""
-    tv_db_path = CONFIG.get("data_sources", {}).get("tradingview_db", "../tradingView_signal_generator/data/tradingview.db")
-    tv_db = Path(tv_db_path).resolve() if Path(tv_db_path).is_absolute() else Path(__file__).parent.parent.parent / tv_db_path
-    return tv_db
+    return _resolve(CONFIG.get("data_sources", {}).get("tradingview_db", "../tradingView_signal_generator/data/tradingview.db"))
 
 
 # ============================================================================

@@ -148,12 +148,25 @@ class TradePosition:
         return self.spread_width >= 3 * self.credit
 
 
+def _clock_now() -> datetime:
+    """Current time, honoring the backtest clock override if one is installed.
+
+    Routes through risk_manager so position open/close timestamps reflect the
+    backtest moment in backtest mode. Live/cloud → real wall clock (unchanged).
+    """
+    try:
+        from risk_manager import _now_dt
+        return _now_dt()
+    except Exception:
+        return datetime.now()
+
+
 def _now_et() -> str:
-    return datetime.now().strftime("%H:%M:%S")
+    return _clock_now().strftime("%H:%M:%S")
 
 
 def _timestamp_et() -> str:
-    return datetime.now().strftime("%Y-%m-%dT%H:%M:%S-04:00")
+    return _clock_now().strftime("%Y-%m-%dT%H:%M:%S-04:00")
 
 
 # ---------------------------------------------------------------------------

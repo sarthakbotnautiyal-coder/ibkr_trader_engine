@@ -1,13 +1,15 @@
 """
-backtests_db.py — SQLite database for backtest runs and results.
+backtests_db.py — registry of backtest runs.
 
-Similar to trades_db.py but separate schema for historical backtesting.
-Each backtest run gets a unique ID and tracks signals + positions for that date.
+Each backtest run gets a unique id and its OWN isolated positions database that
+uses the EXACT same schema as live trading (trades_db). This is deliberate:
+"similar to what we have now" means the real positions/signals tables, not a
+parallel schema. The engine runs in backtest mode against that isolated DB, so
+backtest results are recorded by the same code paths that record live trades.
 
-Schema:
-  - backtests: Metadata for each backtest run (id, date, start_time, end_time, stats)
-  - backtest_signals: Entry signals generated during backtest (backtest_id, strike, premium, etc.)
-  - backtest_positions: Positions taken during backtest (backtest_id, entry, exit, P&L)
+Layout:
+  data/backtests/index.db                 — this registry (backtest_runs table)
+  data/backtests/run_<id>_<date>.db        — one run's positions/signals (trades_db schema)
 """
 import sqlite3
 from pathlib import Path
@@ -19,300 +21,141 @@ from config import CONFIG
 
 _LOG = logging.getLogger(__name__)
 
-# Get backtests DB path from config
-_BACKTESTS_DB_PATH = Path(CONFIG.get("backtesting", {}).get("db_path", "data/backtests.db"))
+# Backtests live under the engine's data dir (config: backtesting.db_path's parent)
+_ENGINE_ROOT = Path(__file__).parent.parent
+_BACKTESTS_DIR = _ENGINE_ROOT / "data" / "backtests"
+_INDEX_DB = _BACKTESTS_DIR / "index.db"
 
 
-def get_backtests_db_path() -> Path:
-    """Return backtests.db path, creating directory if needed."""
-    db_dir = _BACKTESTS_DB_PATH.parent
-    db_dir.mkdir(parents=True, exist_ok=True)
-    return _BACKTESTS_DB_PATH
+def _ensure_dir() -> None:
+    _BACKTESTS_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def init_backtests_db() -> None:
-    """Create backtests schema if not exists."""
-    db_path = get_backtests_db_path()
-
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
-
-    # Backtests metadata table
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS backtests (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            backtest_date TEXT NOT NULL UNIQUE,
-            created_at TEXT NOT NULL,
-            completed_at TEXT,
+def init_registry() -> None:
+    """Create the backtest_runs registry table if absent."""
+    _ensure_dir()
+    conn = sqlite3.connect(_INDEX_DB)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS backtest_runs (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            backtest_date TEXT NOT NULL,
+            db_path       TEXT,
+            created_at    TEXT NOT NULL,
+            completed_at  TEXT,
+            status        TEXT DEFAULT 'running',
+            ticks         INTEGER DEFAULT 0,
             total_signals INTEGER DEFAULT 0,
-            total_entries INTEGER DEFAULT 0,
-            total_exits INTEGER DEFAULT 0,
-            total_trades INTEGER DEFAULT 0,
-            winning_trades INTEGER DEFAULT 0,
-            losing_trades INTEGER DEFAULT 0,
-            total_pnl REAL DEFAULT 0.0,
-            max_drawdown REAL DEFAULT 0.0,
-            notes TEXT,
-            status TEXT DEFAULT 'running'
+            total_positions INTEGER DEFAULT 0,
+            open_positions  INTEGER DEFAULT 0,
+            closed_positions INTEGER DEFAULT 0,
+            total_pnl     REAL DEFAULT 0.0
         )
     """)
-
-    # Backtest signals table
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS backtest_signals (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            backtest_id INTEGER NOT NULL,
-            signal_time TEXT NOT NULL,
-            side TEXT NOT NULL,
-            strike REAL NOT NULL,
-            premium REAL NOT NULL,
-            call_spread TEXT,
-            put_spread TEXT,
-            rsi REAL,
-            vix REAL,
-            reason TEXT,
-            FOREIGN KEY (backtest_id) REFERENCES backtests(id)
-        )
-    """)
-
-    # Backtest positions table
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS backtest_positions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            backtest_id INTEGER NOT NULL,
-            position_id TEXT UNIQUE NOT NULL,
-            side TEXT NOT NULL,
-            strike REAL NOT NULL,
-            entry_time TEXT NOT NULL,
-            entry_price REAL NOT NULL,
-            exit_time TEXT,
-            exit_price REAL,
-            pnl REAL,
-            pnl_pct REAL,
-            status TEXT DEFAULT 'open',
-            FOREIGN KEY (backtest_id) REFERENCES backtests(id)
-        )
-    """)
-
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_backtest_date ON backtests(backtest_date)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_backtest_signals_id ON backtest_signals(backtest_id)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_backtest_positions_id ON backtest_positions(backtest_id)")
-
     conn.commit()
     conn.close()
-
-    _LOG.info(f"Backtests DB initialized: {db_path}")
-
-
-def get_conn() -> sqlite3.Connection:
-    """Get connection to backtests DB."""
-    db_path = get_backtests_db_path()
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    return conn
+    _LOG.info(f"Backtest registry ready: {_INDEX_DB}")
 
 
-def create_backtest(backtest_date: str) -> int:
+def create_run(backtest_date: str) -> tuple[int, Path]:
     """
-    Create a new backtest run record.
+    Register a new backtest run and return (run_id, isolated_db_path).
 
-    Args:
-        backtest_date: Date string (YYYY-MM-DD)
-
-    Returns:
-        Backtest ID
+    The isolated DB uses the trades_db schema and is created fresh per run so
+    runs never mix. A second backtest of the same date gets a distinct id+file.
     """
-    conn = get_conn()
-    cursor = conn.cursor()
-
+    _ensure_dir()
     created_at = datetime.now().isoformat()
-
-    cursor.execute("""
-        INSERT INTO backtests (backtest_date, created_at, status)
-        VALUES (?, ?, 'running')
-    """, (backtest_date, created_at))
-
-    conn.commit()
-    backtest_id = cursor.lastrowid
-    conn.close()
-
-    _LOG.info(f"Created backtest #{backtest_id} for {backtest_date}")
-    return backtest_id
-
-
-def record_signal(backtest_id: int, signal_time: str, side: str, strike: float,
-                  premium: float, rsi: Optional[float] = None, vix: Optional[float] = None,
-                  reason: Optional[str] = None) -> int:
-    """Record a signal generated during backtest."""
-    conn = get_conn()
-    cursor = conn.cursor()
-
-    cursor.execute("""
-        INSERT INTO backtest_signals
-        (backtest_id, signal_time, side, strike, premium, rsi, vix, reason)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, (backtest_id, signal_time, side, strike, premium, rsi, vix, reason))
-
-    conn.commit()
-    signal_id = cursor.lastrowid
-    conn.close()
-
-    return signal_id
-
-
-def record_position(backtest_id: int, position_id: str, side: str, strike: float,
-                    entry_time: str, entry_price: float) -> int:
-    """Record a position opened during backtest."""
-    conn = get_conn()
-    cursor = conn.cursor()
-
-    cursor.execute("""
-        INSERT INTO backtest_positions
-        (backtest_id, position_id, side, strike, entry_time, entry_price, status)
-        VALUES (?, ?, ?, ?, ?, ?, 'open')
-    """, (backtest_id, position_id, side, strike, entry_time, entry_price))
-
-    conn.commit()
-    pos_id = cursor.lastrowid
-    conn.close()
-
-    return pos_id
-
-
-def close_position(backtest_id: int, position_id: str, exit_time: str,
-                   exit_price: float, pnl: float) -> None:
-    """Mark a position as closed."""
-    conn = get_conn()
-    cursor = conn.cursor()
-
-    # Get entry price for P&L calculation
-    cursor.execute("""
-        SELECT entry_price FROM backtest_positions
-        WHERE backtest_id = ? AND position_id = ?
-    """, (backtest_id, position_id))
-
-    row = cursor.fetchone()
-    if not row:
-        _LOG.warning(f"Position {position_id} not found in backtest {backtest_id}")
-        conn.close()
-        return
-
-    entry_price = row["entry_price"]
-    pnl_pct = ((exit_price - entry_price) / entry_price * 100) if entry_price != 0 else 0
-
-    cursor.execute("""
-        UPDATE backtest_positions
-        SET exit_time = ?, exit_price = ?, pnl = ?, pnl_pct = ?, status = 'closed'
-        WHERE backtest_id = ? AND position_id = ?
-    """, (exit_time, exit_price, pnl, pnl_pct, backtest_id, position_id))
-
+    conn = sqlite3.connect(_INDEX_DB)
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO backtest_runs (backtest_date, created_at, status) VALUES (?, ?, 'running')",
+        (backtest_date, created_at),
+    )
+    run_id = cur.lastrowid
+    db_path = _BACKTESTS_DIR / f"run_{run_id}_{backtest_date}.db"
+    cur.execute("UPDATE backtest_runs SET db_path = ? WHERE id = ?", (str(db_path), run_id))
     conn.commit()
     conn.close()
+    _LOG.info(f"Backtest run #{run_id} registered for {backtest_date} → {db_path}")
+    return run_id, db_path
 
 
-def finalize_backtest(backtest_id: int) -> Dict[str, Any]:
+def finalize_run(run_id: int, db_path: Path, ticks: int) -> Dict[str, Any]:
     """
-    Finalize backtest run: calculate stats and mark complete.
-
-    Returns:
-        Dict with summary statistics
+    Compute summary stats from the run's isolated positions DB and update the
+    registry. Stats come from the real positions/signals tables.
     """
-    conn = get_conn()
-    cursor = conn.cursor()
+    stats = _summarize_positions(db_path)
+    stats["ticks"] = ticks
+    stats["run_id"] = run_id
 
-    # Get all closed positions
-    cursor.execute("""
-        SELECT COUNT(*) as total,
-               SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as winners,
-               SUM(CASE WHEN pnl <= 0 THEN 1 ELSE 0 END) as losers,
-               SUM(pnl) as total_pnl,
-               MIN(pnl) as worst_trade
-        FROM backtest_positions
-        WHERE backtest_id = ? AND status = 'closed'
-    """, (backtest_id,))
-
-    stats_row = cursor.fetchone()
-    total_trades = stats_row["total"] or 0
-    winning_trades = stats_row["winners"] or 0
-    losing_trades = stats_row["losers"] or 0
-    total_pnl = stats_row["total_pnl"] or 0.0
-
-    # Get signal counts
-    cursor.execute("""
-        SELECT COUNT(*) as total_signals FROM backtest_signals
-        WHERE backtest_id = ?
-    """, (backtest_id,))
-
-    signal_count = cursor.fetchone()["total_signals"] or 0
-
-    # Count entries/exits
-    cursor.execute("""
-        SELECT COUNT(*) as entries FROM backtest_positions
-        WHERE backtest_id = ? AND status = 'open'
-    """, (backtest_id,))
-
-    open_positions = cursor.fetchone()["entries"] or 0
-
-    completed_at = datetime.now().isoformat()
-
-    cursor.execute("""
-        UPDATE backtests
-        SET completed_at = ?,
-            total_signals = ?,
-            total_entries = ?,
-            total_exits = ?,
-            total_trades = ?,
-            winning_trades = ?,
-            losing_trades = ?,
-            total_pnl = ?,
-            status = 'completed'
+    conn = sqlite3.connect(_INDEX_DB)
+    conn.execute(
+        """
+        UPDATE backtest_runs
+        SET completed_at = ?, status = 'completed', ticks = ?,
+            total_signals = ?, total_positions = ?, open_positions = ?,
+            closed_positions = ?, total_pnl = ?
         WHERE id = ?
-    """, (completed_at, signal_count, open_positions + total_trades, total_trades,
-          total_trades, winning_trades, losing_trades, total_pnl, backtest_id))
-
+        """,
+        (
+            datetime.now().isoformat(), ticks,
+            stats["total_signals"], stats["total_positions"],
+            stats["open_positions"], stats["closed_positions"],
+            stats["total_pnl"], run_id,
+        ),
+    )
     conn.commit()
     conn.close()
-
-    stats = {
-        "backtest_id": backtest_id,
-        "total_signals": signal_count,
-        "total_entries": open_positions + total_trades,
-        "total_trades": total_trades,
-        "winning_trades": winning_trades,
-        "losing_trades": losing_trades,
-        "win_rate": (winning_trades / total_trades * 100) if total_trades > 0 else 0,
-        "total_pnl": total_pnl,
-        "avg_pnl_per_trade": (total_pnl / total_trades) if total_trades > 0 else 0,
-    }
-
-    _LOG.info(f"Backtest #{backtest_id} completed: {stats}")
+    _LOG.info(f"Backtest run #{run_id} finalized: {stats}")
     return stats
 
 
-def get_backtest(backtest_id: int) -> Optional[Dict[str, Any]]:
-    """Get backtest metadata."""
-    conn = get_conn()
-    cursor = conn.cursor()
+def _summarize_positions(db_path: Path) -> Dict[str, Any]:
+    """Read counts and P&L from a run's positions/signals tables."""
+    out = dict(total_signals=0, total_positions=0, open_positions=0,
+               closed_positions=0, total_pnl=0.0, winning=0, losing=0)
+    if not Path(db_path).exists():
+        return out
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
 
-    cursor.execute("SELECT * FROM backtests WHERE id = ?", (backtest_id,))
-    row = cursor.fetchone()
+    def _count(sql: str) -> int:
+        try:
+            return cur.execute(sql).fetchone()[0] or 0
+        except sqlite3.OperationalError:
+            return 0
+
+    out["total_positions"] = _count("SELECT COUNT(*) FROM positions")
+    out["open_positions"] = _count(
+        "SELECT COUNT(*) FROM positions WHERE status IN ('open','pending_open')"
+    )
+    # Any terminal status (closed, expired, ...) counts as closed for the summary.
+    out["closed_positions"] = _count(
+        "SELECT COUNT(*) FROM positions WHERE status NOT IN ('open','pending_open')"
+    )
+    out["total_signals"] = _count("SELECT COUNT(*) FROM signals")
+    out["winning"] = _count("SELECT COUNT(*) FROM positions WHERE pnl > 0")
+    out["losing"] = _count("SELECT COUNT(*) FROM positions WHERE pnl < 0")
+    try:
+        out["total_pnl"] = round(
+            cur.execute("SELECT COALESCE(SUM(pnl),0) FROM positions").fetchone()[0] or 0.0, 2
+        )
+    except sqlite3.OperationalError:
+        pass
+
     conn.close()
+    return out
 
-    return dict(row) if row else None
 
-
-def list_backtests(limit: int = 10) -> List[Dict[str, Any]]:
-    """List recent backtests."""
-    conn = get_conn()
-    cursor = conn.cursor()
-
-    cursor.execute("""
-        SELECT * FROM backtests
-        ORDER BY created_at DESC
-        LIMIT ?
-    """, (limit,))
-
-    rows = [dict(row) for row in cursor.fetchall()]
+def list_runs(limit: int = 20) -> List[Dict[str, Any]]:
+    """List recent backtest runs from the registry."""
+    if not _INDEX_DB.exists():
+        return []
+    conn = sqlite3.connect(_INDEX_DB)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        "SELECT * FROM backtest_runs ORDER BY created_at DESC LIMIT ?", (limit,)
+    ).fetchall()
     conn.close()
-
-    return rows
+    return [dict(r) for r in rows]
