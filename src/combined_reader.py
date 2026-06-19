@@ -11,6 +11,7 @@ and the engine tick is skipped.
 """
 import re
 import sqlite3
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -40,6 +41,50 @@ class StaleDataError(Exception):
     of the scan timestamp.  The engine tick should be skipped when this is raised.
     """
     pass
+
+
+# ---------------------------------------------------------------------------
+# WAL resilience (TASK-2026-235)
+# ---------------------------------------------------------------------------
+
+# Max retry attempts on sqlite3.OperationalError when opening tradingview.db
+_TV_CONNECT_MAX_ATTEMPTS = 3
+# Backoff per attempt (seconds) — 0.2s, 0.4s, 0.6s
+_TV_CONNECT_BACKOFFS = (0.2, 0.4, 0.6)
+# sqlite connect timeout — short, so retry-loop drives recovery
+_TV_CONNECT_TIMEOUT = 2.0
+
+
+def _connect_tv_with_retry() -> "sqlite3.Connection":
+    """Open tradingview.db with WAL-aware retry.
+
+    Reader-writer contention on the shared tradingview.db can surface as
+    ``sqlite3.OperationalError: unable to open database file`` even though
+    the file exists. Retry with short backoff and a 2s connect timeout.
+
+    Returns:
+        sqlite3.Connection with WAL journal mode enabled.
+
+    Raises:
+        RuntimeError: if all retry attempts fail. The outer engine tick
+            retry (Fix 1) will catch and continue.
+    """
+    last_err: Optional[Exception] = None
+    for attempt in range(1, _TV_CONNECT_MAX_ATTEMPTS + 1):
+        try:
+            conn = sqlite3.connect(str(TV_DB), timeout=_TV_CONNECT_TIMEOUT)
+            conn.execute("PRAGMA journal_mode = WAL;")
+            return conn
+        except sqlite3.OperationalError as e:
+            last_err = e
+            if attempt < _TV_CONNECT_MAX_ATTEMPTS:
+                backoff = _TV_CONNECT_BACKOFFS[attempt - 1]
+                time.sleep(backoff)
+                continue
+            break
+    raise RuntimeError(
+        f"Failed to open tradingview.db after {_TV_CONNECT_MAX_ATTEMPTS} attempts: {last_err}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -219,9 +264,9 @@ def _fetch_tv_in_window(scan_ts: str) -> tuple:
     (scan_ts - 10min) <= received_at <= scan_ts.
 
     Raises StaleDataError if no row exists in the window.
+    Raises RuntimeError if tradingview.db cannot be opened after retries.
     """
-    conn = sqlite3.connect(str(TV_DB))
-    conn.execute("PRAGMA journal_mode = WAL;")
+    conn = _connect_tv_with_retry()
 
     window_start_sql, _, upper_bound_tv = _window_clause(scan_ts)
 
@@ -371,8 +416,8 @@ def get_combined_snapshot(scan_timestamp: str) -> CombinedSnapshot:
 
     # --- TradingView (as-of join, 10-min freshness window) ------------------
     # Raises StaleDataError if no row in window
-    conn_tv = sqlite3.connect(str(TV_DB))
-    conn_tv.execute("PRAGMA journal_mode = WAL;")
+    # TASK-2026-235: WAL-aware retry (3 attempts, 0.2/0.4/0.6s backoff)
+    conn_tv = _connect_tv_with_retry()
 
     window_start_sql, _, upper_bound_tv = _window_clause(scan_timestamp)
 

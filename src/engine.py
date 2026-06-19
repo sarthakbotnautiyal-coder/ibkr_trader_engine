@@ -1601,8 +1601,17 @@ class AutoTraderEngine:
                 while not self.client.is_connected():
                     self.logger.info("Waiting for IBKR connection...")
                     time.sleep(2)
+            # TASK-2026-235: outer loop resilient to transient failures (e.g. WAL contention).
+            # KeyboardInterrupt is re-raised so SIGTERM/Ctrl+C still hits the outer except below.
             while True:
-                self.tick()
+                try:
+                    self.tick()
+                except KeyboardInterrupt:
+                    raise
+                except Exception as e:
+                    self.logger.exception(
+                        f"Engine tick failed (will retry in {self.check_interval}s): {e}"
+                    )
                 time.sleep(self.check_interval)
         except KeyboardInterrupt:
             self.logger.info("Engine stopped by user (Ctrl+C)")
