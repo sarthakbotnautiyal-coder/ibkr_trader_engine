@@ -24,8 +24,13 @@ sys.path.insert(0, str(_root / "src")) # src/: makes 'from src.foo import X' als
 # ---------------------------------------------------------------------------
 
 # is_market_open() returns True for all tests (avoids clock-time dependency)
-_patch_market_open = patch("src.risk_manager.is_market_open", return_value=True)
-_patch_market_open.start()
+# Guard against import failures in test-specific modules
+try:
+    _patch_market_open = patch("src.risk_manager.is_market_open", return_value=True)
+    _patch_market_open.start()
+except (ImportError, AttributeError):
+    # If risk_manager can't be imported, skip this patch
+    pass
 
 
 # ---------------------------------------------------------------------------
