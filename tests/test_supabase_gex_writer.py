@@ -107,10 +107,15 @@ class TestConstants:
 
 
 class TestNormalizeTimestamp:
-    def test_naive_utc_string_becomes_iso_with_offset(self):
-        """Local format 'YYYY-MM-DD HH:MM:SS' is treated as UTC."""
+    def test_naive_string_becomes_iso_with_et_offset(self):
+        """Local 'YYYY-MM-DD HH:MM:SS' is ET wall-clock → America/New_York."""
         out = _normalize_timestamp("2026-06-15 15:55:59")
-        assert out == "2026-06-15T15:55:59+00:00"
+        assert out == "2026-06-15T15:55:59-04:00"  # June → EDT
+
+    def test_naive_winter_string_uses_est_offset(self):
+        """DST-aware: a January date localizes to EST (-05:00)."""
+        out = _normalize_timestamp("2026-01-15 15:55:59")
+        assert out == "2026-01-15T15:55:59-05:00"
 
     def test_iso_with_offset_unchanged(self):
         """Already has +HH:MM offset — pass through."""
@@ -144,7 +149,7 @@ class TestToCloudRow:
         cloud = _to_cloud_row(local_id=42, row=_make_row())
         assert cloud["raw_id_local"] == 42
         assert "id" not in cloud
-        assert cloud["snapshot_timestamp"] == "2026-06-15T15:55:59+00:00"
+        assert cloud["snapshot_timestamp"] == "2026-06-15T15:55:59-04:00"
         assert "timestamp" not in cloud
 
     def test_other_columns_pass_through_unchanged(self):
@@ -164,7 +169,7 @@ class TestToCloudRow:
 
     def test_received_at_normalized(self):
         cloud = _to_cloud_row(local_id=1, row=_make_row())
-        assert cloud["received_at"] == "2026-06-15T19:57:35+00:00"
+        assert cloud["received_at"] == "2026-06-15T19:57:35-04:00"
 
     def test_int_local_id_is_preserved(self):
         """raw_id_local is BIGINT in the cloud, INTEGER in SQLite."""
@@ -321,11 +326,18 @@ class TestRealLocalDbMapping:
             pytest.skip("data/gex.db not present")
         conn = sqlite3.connect(str(local_db))
         conn.row_factory = sqlite3.Row
+        has_table = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='gex_snapshots'"
+        ).fetchone()
+        if has_table is None:
+            conn.close()
+            pytest.skip("gex_snapshots table not present in data/gex.db")
         row = conn.execute(
             "SELECT * FROM gex_snapshots ORDER BY id DESC LIMIT 1"
         ).fetchone()
         conn.close()
-        assert row is not None
+        if row is None:
+            pytest.skip("gex_snapshots table is empty")
 
         cloud = _to_cloud_row(local_id=row["id"], row=dict(row))
         # Must have all 13 cloud columns

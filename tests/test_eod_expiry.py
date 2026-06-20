@@ -120,6 +120,9 @@ def test_close_expired_marks_expired_and_inserts_signal(tmp_path):
         eng._TASK_ID = "TEST"
         eng._eod_expiry_done = set()
         eng.store = MagicMock()
+        # __new__ bypasses __init__, so set the clock seams _now() relies on.
+        eng.mode = "local"
+        eng._clock = None
 
         # Pass _db_path so the engine writes to the test DB, not production
         eng._close_expired_positions(

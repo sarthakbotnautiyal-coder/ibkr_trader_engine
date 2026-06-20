@@ -158,7 +158,8 @@ def _clock_now() -> datetime:
         from risk_manager import _now_dt
         return _now_dt()
     except Exception:
-        return datetime.now()
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("America/New_York"))
 
 
 def _now_et() -> str:
@@ -166,7 +167,9 @@ def _now_et() -> str:
 
 
 def _timestamp_et() -> str:
-    return _clock_now().strftime("%Y-%m-%dT%H:%M:%S-04:00")
+    # _clock_now() is ET-aware (routes through risk_manager._now_dt). isoformat()
+    # emits the correct EST/EDT offset for the date (DST-aware).
+    return _clock_now().isoformat(timespec="seconds")
 
 
 # ---------------------------------------------------------------------------

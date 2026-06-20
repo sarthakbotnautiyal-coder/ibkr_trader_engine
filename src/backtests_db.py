@@ -14,12 +14,20 @@ Layout:
 import sqlite3
 from pathlib import Path
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from typing import Optional, List, Dict, Any
 import logging
 
 from config import CONFIG
 
 _LOG = logging.getLogger(__name__)
+
+# Registry audit timestamps are stamped in Eastern time for readability.
+_ET = ZoneInfo("America/New_York")
+
+
+def _now_et_iso() -> str:
+    return datetime.now(_ET).isoformat(timespec="seconds")
 
 # Backtests live under the engine's data dir (config: backtesting.db_path's parent)
 _ENGINE_ROOT = Path(__file__).parent.parent
@@ -64,7 +72,7 @@ def create_run(backtest_date: str) -> tuple[int, Path]:
     runs never mix. A second backtest of the same date gets a distinct id+file.
     """
     _ensure_dir()
-    created_at = datetime.now().isoformat()
+    created_at = _now_et_iso()
     conn = sqlite3.connect(_INDEX_DB)
     cur = conn.cursor()
     cur.execute(
@@ -99,7 +107,7 @@ def finalize_run(run_id: int, db_path: Path, ticks: int) -> Dict[str, Any]:
         WHERE id = ?
         """,
         (
-            datetime.now().isoformat(), ticks,
+            _now_et_iso(), ticks,
             stats["total_signals"], stats["total_positions"],
             stats["open_positions"], stats["closed_positions"],
             stats["total_pnl"], run_id,

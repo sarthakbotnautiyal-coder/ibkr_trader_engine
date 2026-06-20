@@ -49,6 +49,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from typing import Optional
 
 from config import CONFIG
@@ -58,10 +59,16 @@ from config import CONFIG
 # Time helpers
 # ---------------------------------------------------------------------------
 
+# Single source of truth for the trading timezone. ZoneInfo handles EST/EDT
+# automatically, so timestamps carry the correct offset (-05:00 in winter,
+# -04:00 in summer) without any hardcoding.
+ET = ZoneInfo("America/New_York")
+
 # Backtest clock override. When set (callable returning a datetime), all time
 # helpers below use it instead of the wall clock. Live/cloud leave it None →
 # real time, so live behavior is unchanged. The engine sets this in backtest so
 # market-hours gating (is_market_open) evaluates against the historical date.
+# The override is expected to return an ET-aware datetime.
 _CLOCK_OVERRIDE = None
 
 
@@ -72,7 +79,8 @@ def set_clock_override(fn) -> None:
 
 
 def _now_dt():
-    return _CLOCK_OVERRIDE() if _CLOCK_OVERRIDE is not None else datetime.now()
+    """Current ET-aware datetime (backtest clock when overridden, else now)."""
+    return _CLOCK_OVERRIDE() if _CLOCK_OVERRIDE is not None else datetime.now(ET)
 
 
 def _now_et() -> str:
@@ -80,7 +88,8 @@ def _now_et() -> str:
 
 
 def _timestamp_et() -> str:
-    return _now_dt().strftime("%Y-%m-%dT%H:%M:%S-04:00")
+    # isoformat() emits the correct EST/EDT offset for the date (DST-aware).
+    return _now_dt().isoformat(timespec="seconds")
 
 
 def _parse_hhmm(ts: str) -> tuple[int, int]:

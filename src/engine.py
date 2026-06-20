@@ -198,10 +198,13 @@ class AutoTraderEngine:
     # -------------------------------------------------------------------------
 
     def _now(self) -> datetime:
-        """Current time. Live/cloud: wall clock. Backtest: the snapshot's timestamp."""
+        """Current ET-aware time. Live/cloud: wall clock in ET. Backtest: the
+        snapshot's timestamp (ET-aware). isoformat() on the result emits the
+        correct EST/EDT offset for the date (DST-aware)."""
         if self.mode == "backtest" and self._clock is not None:
             return self._clock
-        return datetime.now()
+        from risk_manager import ET
+        return datetime.now(ET)
 
     def _fetch_combined(self):
         """Fetch the combined snapshot for this tick.
@@ -216,10 +219,15 @@ class AutoTraderEngine:
         return get_combined_for_latest_scan()
 
     def _parse_clock(self, ts: str) -> datetime:
-        """Parse a scan timestamp (ISO with offset) into a naive datetime."""
+        """Parse a scan timestamp (ISO with offset) into an ET-aware datetime.
+
+        Scanner timestamps are ET wall-clock; we attach America/New_York so the
+        backtest clock carries the correct EST/EDT offset and downstream
+        isoformat() emits it (DST-aware)."""
         from combined_reader import _parse_ts
+        from risk_manager import ET
         main = _parse_ts(ts).split('.')[0]
-        return datetime.strptime(main, "%Y-%m-%d %H:%M:%S")
+        return datetime.strptime(main, "%Y-%m-%d %H:%M:%S").replace(tzinfo=ET)
 
     def _recover_pending_orders(self) -> None:
         """
@@ -450,7 +458,7 @@ class AutoTraderEngine:
         if self.dry_run:
             return
 
-        now_ts = datetime.now().strftime("%Y-%m-%dT%H:%M:%S-04:00")
+        now_ts = self._now().isoformat(timespec="seconds")
         now_epoch = time.time()
 
         # ---- Entry timeouts ----
@@ -560,7 +568,7 @@ class AutoTraderEngine:
         # Update DB: pending_open → open, record fill info
         from trades_db import get_conn, update_position_status, update_position_fill, mark_signal_filled
 
-        fill_ts = datetime.now().strftime("%Y-%m-%dT%H:%M:%S-04:00")
+        fill_ts = self._now().isoformat(timespec="seconds")
         with get_conn() as conn:
             update_position_fill(conn, db_id, fill_price=avg_price, fill_time=fill_ts)
             update_position_status(conn, db_id, status="open")
@@ -639,7 +647,7 @@ class AutoTraderEngine:
             self._pending_exits.pop(order_id)
         self._pending_exit_times.pop(order_id, None)
 
-        fill_ts = datetime.now().strftime("%Y-%m-%dT%H:%M:%S-04:00")
+        fill_ts = self._now().isoformat(timespec="seconds")
 
         # Compute actual P&L using original credit and actual close debit
         # P&L = (original_credit * 100 * contracts) - (close_debit * 100 * contracts)
@@ -981,7 +989,7 @@ class AutoTraderEngine:
             # positions and assigns full-credit P&L on worthless 0DTE expiry —
             # matching LIVE behavior. Live DRY_RUN keeps order_time=None (unchanged).
             bt_order_time = (
-                self._now().strftime("%Y-%m-%dT%H:%M:%S-04:00")
+                self._now().isoformat(timespec="seconds")
                 if self.mode == "backtest" else None
             )
             db_id = store.add_position(
@@ -1065,7 +1073,7 @@ class AutoTraderEngine:
             layer=decision.layer,
             num_contracts=num_contracts,
         )
-        order_time = datetime.now().strftime("%Y-%m-%dT%H:%M:%S-04:00")
+        order_time = self._now().isoformat(timespec="seconds")
         store._positions.append(pos)  # track in-memory for overlap check
 
         db_id = store.add_position(
@@ -1359,8 +1367,11 @@ class AutoTraderEngine:
         from trades_db import get_conn, get_open_positions_for_date, insert_signal
 
         # Use the engine clock so backtest stamps the close at the backtest
-        # date's 16:00 (not wall-clock). Live: self._now() == datetime.now().
-        close_ts = self._now().strftime("%Y-%m-%dT16:00:00-0400")
+        # date's 16:00 ET (not wall-clock). isoformat() emits the correct
+        # EST/EDT offset for the date (DST-aware). Live: self._now() is now(ET).
+        close_ts = self._now().replace(
+            hour=16, minute=0, second=0, microsecond=0
+        ).isoformat(timespec="seconds")
         _conn_kwargs = {"path": _db_path} if _db_path else {}
 
         try:
