@@ -10,12 +10,17 @@ scan_premiums uses get_scanner_logger() for the same daily-rotation pattern.
 from __future__ import annotations
 
 import logging
-from datetime import date
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from pathlib import Path
+
+# Trading timezone — log files rotate on the Eastern (EST/EDT) calendar day so
+# filenames line up with the market session rather than the system/UTC day.
+ET = ZoneInfo("America/New_York")
 
 
 def _today() -> str:
-    return date.today().strftime("%Y-%m-%d")
+    return datetime.now(ET).strftime("%Y-%m-%d")
 
 
 def _make_handler(log_path: Path) -> logging.FileHandler:

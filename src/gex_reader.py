@@ -1,21 +1,23 @@
 """
-gex_reader.py — read from data/gex.db + regime judgment.
+gex_reader.py — read GEX data from LOCAL or CLOUD sources.
+
+Uses data_sources abstraction layer to support both LOCAL (SQLite) and CLOUD (Supabase) modes.
 """
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+import logging
 
-# Import config for data source paths
-import sys
-sys.path.insert(0, str(Path(__file__).parent.parent))
 from config import CONFIG
+from data_sources import get_gex_snapshots_table, get_tradingview_fundamentals_table, is_local_mode
 
-# Read paths from config
+_LOG = logging.getLogger(__name__)
+
+# For LOCAL mode only
 GEX_DB_PATH = CONFIG.get("data_sources", {}).get("gex_db", "../gex_extractor/data/gex.db")
 TV_DB_PATH = CONFIG.get("data_sources", {}).get("tradingview_db", "../tradingView_signal_generator/data/tradingview.db")
 
-# Resolve to absolute paths
 GEX_DB = Path(GEX_DB_PATH).resolve() if Path(GEX_DB_PATH).exists() or Path(GEX_DB_PATH).is_absolute() else Path(__file__).parent.parent.parent / GEX_DB_PATH
 TV_DB = Path(TV_DB_PATH).resolve() if Path(TV_DB_PATH).exists() or Path(TV_DB_PATH).is_absolute() else Path(__file__).parent.parent.parent / TV_DB_PATH
 
@@ -64,44 +66,83 @@ def _row_to_gex(row: tuple) -> GexSnapshot:
     )
 
 
-def get_latest_gex(db_path: Path = GEX_DB) -> Optional[GexSnapshot]:
-    conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA journal_mode = WAL;")
-    row = conn.execute(
-        "SELECT * FROM gex_snapshots ORDER BY timestamp DESC LIMIT 1"
-    ).fetchone()
-    conn.close()
-    if row is None:
+def get_latest_gex(db_path: Path = None) -> Optional[GexSnapshot]:
+    """Get latest GEX snapshot (supports LOCAL and CLOUD modes)."""
+    try:
+        if is_local_mode():
+            # LOCAL mode: Read directly from SQLite
+            if db_path is None:
+                db_path = GEX_DB
+            conn = sqlite3.connect(db_path)
+            conn.execute("PRAGMA journal_mode = WAL;")
+            row = conn.execute(
+                "SELECT * FROM gex_snapshots ORDER BY timestamp DESC LIMIT 1"
+            ).fetchone()
+            conn.close()
+            if row is None:
+                return None
+            return _row_to_gex(row)
+        else:
+            # CLOUD mode: Use abstraction layer
+            rows = get_gex_snapshots_table(limit=1)
+            if not rows:
+                return None
+            row = rows[0]
+            # Convert dict to tuple for compatibility
+            return GexSnapshot(
+                id=row.get("id"),
+                timestamp=row.get("snapshot_timestamp"),
+                received_at=row.get("received_at"),
+                gex_by_oi=row.get("gex_by_oi"),
+                gex_by_volume=row.get("gex_by_volume"),
+                spot=row.get("spot"),
+                major_negative_by_volume=row.get("major_negative_by_volume"),
+                major_positive_by_volume=row.get("major_positive_by_volume"),
+                major_negative_by_oi=row.get("major_negative_by_oi"),
+                major_positive_by_oi=row.get("major_positive_by_oi"),
+                zero_gamma=row.get("zero_gamma"),
+                raw_message=row.get("raw_message"),
+            )
+    except Exception as e:
+        _LOG.warning(f"Error reading GEX data: {e}")
         return None
-    return _row_to_gex(row)
 
 
 def get_latest_regime() -> str:
     """
-    Read the most recent non-NULL regime from tradingview.db spx_standardized.
-
-    Only 'indicator_snapshot'/'fundamentals' rows have regime values.
-    Rows from other alert_category/alert_type pairs (e.g., market_comparison/
-    OTM_value) have NULL regime and must be excluded.
+    Read the most recent regime from TradingView data (supports LOCAL and CLOUD modes).
 
     Returns regime string (e.g., 'neutral', 'momentum_up') or 'unknown' if
     no valid row exists.
     """
-    conn = sqlite3.connect(str(TV_DB))
-    conn.execute("PRAGMA journal_mode = WAL;")
-    row = conn.execute("""
-        SELECT regime
-        FROM spx_standardized
-        WHERE alert_category  = 'indicator_snapshot'
-          AND alert_type      = 'fundamentals'
-          AND regime          IS NOT NULL
-          AND regime          != ''
-        ORDER BY id DESC
-        LIMIT 1
-    """).fetchone()
-    conn.close()
-    if row and row[0]:
-        return row[0].strip()
+    try:
+        if is_local_mode():
+            # LOCAL mode: Direct SQLite query
+            conn = sqlite3.connect(str(TV_DB))
+            conn.execute("PRAGMA journal_mode = WAL;")
+            row = conn.execute("""
+                SELECT regime
+                FROM spx_standardized
+                WHERE alert_category  = 'indicator_snapshot'
+                  AND alert_type      = 'fundamentals'
+                  AND regime          IS NOT NULL
+                  AND regime          != ''
+                ORDER BY id DESC
+                LIMIT 1
+            """).fetchone()
+            conn.close()
+            if row and row[0]:
+                return row[0].strip()
+        else:
+            # CLOUD mode: Use abstraction layer
+            rows = get_tradingview_fundamentals_table(limit=1)
+            if rows:
+                regime = rows[0].get("regime")
+                if regime:
+                    return regime.strip()
+    except Exception as e:
+        _LOG.warning(f"Error reading regime: {e}")
+
     return "unknown"
 
 

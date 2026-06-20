@@ -264,9 +264,13 @@ class IBKRClient:
 # ---------------------------------------------------------------------------
 
 def today_expiry() -> str:
-    """Return today's date as YYYYMMDD — SPXW options expire daily (Mon–Fri)."""
-    from datetime import date
-    return date.today().strftime("%Y%m%d")
+    """Return today's ET date as YYYYMMDD — SPXW options expire daily (Mon–Fri).
+
+    Uses Eastern time so the 0DTE expiry date matches the trading session even
+    when the host clock is not in ET (DST-aware)."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    return datetime.now(ZoneInfo("America/New_York")).strftime("%Y%m%d")
 
 
 def build_order_params(

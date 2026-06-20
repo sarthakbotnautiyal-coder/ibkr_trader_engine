@@ -33,10 +33,14 @@ import logging
 import os
 import threading
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Any, Optional
 
 from dotenv import load_dotenv
+
+# Trading timezone — naive local timestamps are Eastern wall-clock.
+_ET = ZoneInfo("America/New_York")
 
 # Lazy import: supabase is in requirements.txt, but we don't want to fail at
 # import time in environments where it's missing. The actual import happens
@@ -72,14 +76,15 @@ _writer_instance: "SupabaseGexWriter | None" = None
 def _normalize_timestamp(value: str | None) -> str | None:
     """Normalize a local timestamp to ISO 8601 with offset.
 
-    Local timestamps are stored as ``"YYYY-MM-DD HH:MM:SS"`` (naive UTC, from
-    ``datetime.utcnow().strftime(...)`` in fetch_gex.py:115). The cloud schema
-    expects ``TIMESTAMPTZ`` — PostgREST will accept both ISO 8601 with offset
-    and naive timestamps (interpreting the latter as UTC), but being explicit
-    removes ambiguity.
+    Naive ``"YYYY-MM-DD HH:MM:SS"`` values in this system are Eastern wall-clock
+    time: the GEX ``timestamp`` comes from the gex.bot message body (ET) and
+    ``received_at`` is stamped in ET by the extractor. We localize them to
+    America/New_York so the cloud ``TIMESTAMPTZ`` carries the correct EST/EDT
+    offset (DST-aware) instead of being mislabeled as UTC.
 
-    Examples:
-        "2026-06-15 15:55:59" → "2026-06-15T15:55:59+00:00"
+    Examples (summer / EDT):
+        "2026-06-15 15:55:59" → "2026-06-15T15:55:59-04:00"
+        "2026-01-15 15:55:59" → "2026-01-15T15:55:59-05:00"   (winter / EST)
         "2026-06-15T15:55:59-04:00" → "2026-06-15T15:55:59-04:00"  (unchanged)
         None → None
     """
@@ -91,9 +96,9 @@ def _normalize_timestamp(value: str | None) -> str | None:
     # Already ISO 8601 (contains 'T' and either 'Z' or '+' or '-')
     if "T" in s and ("Z" in s or "+" in s[10:] or s.count("-") > 2):
         return s
-    # "YYYY-MM-DD HH:MM:SS" — treat as UTC (matches fetch_gex.py:115 behavior)
+    # "YYYY-MM-DD HH:MM:SS" — naive ET wall-clock; attach America/New_York.
     try:
-        dt = datetime.strptime(s, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        dt = datetime.strptime(s, "%Y-%m-%d %H:%M:%S").replace(tzinfo=_ET)
         return dt.isoformat()
     except ValueError:
         # Best effort: hand it to the cloud and let PostgREST complain
@@ -202,7 +207,7 @@ class SupabaseGexWriter:
         try:
             PENDING_WRITES_PATH.parent.mkdir(parents=True, exist_ok=True)
             entry = {
-                "ts":          datetime.now(timezone.utc).isoformat(),
+                "ts":          datetime.now(_ET).isoformat(),
                 "local_id":    int(local_id),
                 "row":         dict(row),
                 "error":       error,

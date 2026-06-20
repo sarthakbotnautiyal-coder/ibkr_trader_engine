@@ -24,10 +24,14 @@ import logging
 import os
 import threading
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Any, Optional
 
 from dotenv import load_dotenv
+
+# Trading timezone — sync metadata is stamped in Eastern time for readability.
+_ET = ZoneInfo("America/New_York")
 
 try:
     from supabase import Client, create_client  # type: ignore
@@ -81,14 +85,14 @@ def _to_cloud_row(local_id: int, row: dict[str, Any]) -> dict[str, Any]:
     """Map a local scan_results row to a cloud-ready dict.
 
     ``id`` (local) → ``raw_id_local`` (cloud). All other columns pass through
-    unchanged. ``received_at`` is stamped now (UTC) to record when the row
-    arrived in our system.
+    unchanged. ``received_at`` is stamped now (Eastern time) to record when the
+    row arrived in our system.
     """
     return {
         "raw_id_local":       int(local_id),
         "source":             "scanner",
         "timestamp_est":      row.get("timestamp_est"),
-        "received_at":        datetime.now(timezone.utc).isoformat(),
+        "received_at":        datetime.now(_ET).isoformat(),
         "spx_spot":           row.get("spx_spot"),
         "expected_move":      row.get("expected_move"),
         "atm_strike":         row.get("atm_strike"),
@@ -156,7 +160,7 @@ class SupabaseScannerWriter:
         try:
             PENDING_WRITES_PATH.parent.mkdir(parents=True, exist_ok=True)
             entry = {
-                "ts":       datetime.now(timezone.utc).isoformat(),
+                "ts":       datetime.now(_ET).isoformat(),
                 "local_id": int(local_id),
                 "row":      dict(row),
                 "error":    error,
