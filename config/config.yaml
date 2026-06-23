@@ -3,8 +3,6 @@
 
 # Data source configuration (LOCAL or CLOUD)
 data_source_mode: "local"        # "local" (primary) or "cloud" (Supabase)
-supabase_app_id: ""              # Required if data_source_mode: "cloud"
-                                 # Each user gets unique read-only key from Supabase
 
 ibkr:
   host: "127.0.0.1"
