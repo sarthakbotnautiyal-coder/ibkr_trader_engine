@@ -38,6 +38,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from dotenv import load_dotenv
+from config import CONFIG
 
 # Trading timezone — naive local timestamps are Eastern wall-clock.
 _ET = ZoneInfo("America/New_York")
@@ -58,8 +59,15 @@ logger = logging.getLogger(__name__)
 CLOUD_SCHEMA = "trading"
 CLOUD_TABLE  = "gex_snapshots"
 
-# Local DB path — kept here so callers don't need to know the layout.
-LOCAL_DB_PATH = Path(__file__).resolve().parent.parent / "data" / "gex.db"
+# Local DB path — resolved from config (default: ../gex_extractor/data/gex.db).
+# Avoid hardcoding to prevent creating unwanted files in the project directory.
+def _get_local_db_path() -> Path:
+    """Resolve gex.db path from config, matching gex_reader.GEX_DB resolution."""
+    gex_db_config = CONFIG.get("data_sources", {}).get("gex_db", "../gex_extractor/data/gex.db")
+    path = Path(gex_db_config).resolve() if Path(gex_db_config).exists() or Path(gex_db_config).is_absolute() else Path(__file__).parent.parent.parent / gex_db_config
+    return path
+
+LOCAL_DB_PATH = _get_local_db_path()
 
 # JSONL file holding failed writes for retry. Separate from the TV writer's
 # file so retry logic doesn't mix GEX rows with fundamentals rows.

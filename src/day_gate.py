@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Optional
 
 from config import CONFIG
+from gex_reader import GEX_DB
 
 
 # ---------------------------------------------------------------------------
@@ -117,8 +118,6 @@ class DayGate:
             Current scan timestamp (ISO or space format). The 30-minute window
             is computed as (scan_timestamp - 30 min) .. scan_timestamp.
         """
-        GEX_DB = Path(__file__).parent.parent / "data" / "gex.db"
-
         parsed_ts = _parse_ts(scan_timestamp)
         window_start_sql = f"datetime('{parsed_ts}', '-{self._window_minutes} minutes')"
 

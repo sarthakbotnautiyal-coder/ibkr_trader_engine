@@ -40,7 +40,6 @@ from typing import Optional
 
 _REPO_DIR = Path(__file__).parent.parent          # ibkr_auto_trader/
 _SCAN_DB  = _REPO_DIR / "data" / "scanner.db"
-_GEX_DB   = _REPO_DIR / "data" / "gex.db"
 _TV_DB    = Path(
     "/Users/ubexbot/.openclaw/workspace-venkat/"
     "tradingview_signal_generator/data/tradingview.db"
@@ -87,6 +86,7 @@ from risk_manager import (
     EntryDecision,
 )
 from config import CONFIG
+from gex_reader import GEX_DB
 from tick_processor import TickProcessor
 from day_gate import DayGate, DayGateResult
 
