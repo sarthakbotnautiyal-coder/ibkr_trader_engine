@@ -3,7 +3,7 @@ data_sources.py — Abstraction layer for switching between LOCAL and CLOUD data
 
 Supports:
   - LOCAL: Read from SQLite databases (gex_extractor, premium_extractor, tradingview)
-  - CLOUD: Read from Supabase tables (trading.gex_snapshots, trading.scan_results, trading.spx_standardized)
+  - CLOUD: Read from Supabase tables (trading.gex_snapshots, trading.scan_results, trading.trading_view_indicators)
 
 Backtesting:
   - Only works with LOCAL mode
@@ -316,7 +316,7 @@ def _get_gex_snapshots_cloud(as_of_date: Optional[str] = None, limit: int = 100)
     """Query Supabase trading.gex_snapshots (CLOUD mode)."""
     try:
         client = get_supabase_client()
-        query = client.table("gex_snapshots").select("*")
+        query = client.schema("trading").table("gex_snapshots").select("*")
 
         if as_of_date:
             query = query.gte("snapshot_timestamp", f"{as_of_date}T00:00:00").lt("snapshot_timestamp", f"{as_of_date}T23:59:59")
@@ -334,7 +334,7 @@ def _get_scan_results_cloud(as_of_date: Optional[str] = None, limit: int = 100) 
     """Query Supabase trading.scan_results (CLOUD mode)."""
     try:
         client = get_supabase_client()
-        query = client.table("scan_results").select("*")
+        query = client.schema("trading").table("scan_results").select("*")
 
         if as_of_date:
             query = query.gte("timestamp_est", f"{as_of_date}T00:00:00").lt("timestamp_est", f"{as_of_date}T23:59:59")
@@ -349,10 +349,10 @@ def _get_scan_results_cloud(as_of_date: Optional[str] = None, limit: int = 100) 
 
 
 def _get_tradingview_fundamentals_cloud(as_of_date: Optional[str] = None, limit: int = 100) -> list:
-    """Query Supabase trading.spx_standardized (CLOUD mode)."""
+    """Query Supabase trading.trading_view_indicators (CLOUD mode)."""
     try:
         client = get_supabase_client()
-        query = client.table("spx_standardized").select("*").eq("alert_type", "fundamentals")
+        query = client.schema("trading").table("trading_view_indicators").select("*")
 
         if as_of_date:
             query = query.gte("received_at", f"{as_of_date}T00:00:00").lt("received_at", f"{as_of_date}T23:59:59")
@@ -362,5 +362,5 @@ def _get_tradingview_fundamentals_cloud(as_of_date: Optional[str] = None, limit:
 
         return response.data if response.data else []
     except Exception as e:
-        _LOG.warning(f"Failed to read spx_standardized from Supabase: {e}")
+        _LOG.warning(f"Failed to read trading_view_indicators from Supabase: {e}")
         return []
