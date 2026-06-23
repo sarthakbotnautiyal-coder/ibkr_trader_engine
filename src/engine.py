@@ -1184,6 +1184,20 @@ class AutoTraderEngine:
         )
         self._pending_entry_times[result.order_id] = time.time()
 
+        # TASK-2026-179: Record order_id in DB after order is placed to IBKR
+        # This is critical for recovery on restart — allows recovery mechanism to
+        # query IBKR and determine order status. Without order_id, position becomes
+        # orphaned and stuck (see _recover_pending_orders).
+        from trades_db import get_conn, update_position_order_id
+        with get_conn() as conn:
+            update_position_order_id(
+                conn, db_id,
+                order_id=result.order_id,
+                order_action="OPEN",
+                order_time=order_time,
+            )
+            conn.commit()
+
         # Log as pending (not yet confirmed)
         self._log_opened(ts, decision, spx, em, is_pending=True)
         self.logger.info(
@@ -1191,7 +1205,7 @@ class AutoTraderEngine:
             f"order_id={result.order_id} | db_id={db_id} | "
             f"strike={decision.short_strike:.0f}/{decision.long_strike:.0f} | "
             f"available_cash=${available_cash:.2f} | required_margin=${required_margin:.2f} | "
-            f"pending_open written to DB — awaiting IBKR fill confirmation via polling"
+            f"pending_open written to DB with order_id — awaiting IBKR fill confirmation via polling"
         )
 
     def _on_skip(
