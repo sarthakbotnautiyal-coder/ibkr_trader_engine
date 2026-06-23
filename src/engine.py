@@ -234,10 +234,15 @@ class AutoTraderEngine:
         On engine restart, reload pending_open positions from DB and sync with IBKR.
 
         For each pending_open position:
-        1. Query IBKR to check actual order status
-        2. If FILLED: immediately call _on_fill_confirmed to update DB status → 'open'
-        3. If still PENDING: add to _pending_entries for polling to track
-        4. If CANCELLED/INACTIVE: log and mark as such
+        1. Detect orphaned positions (no order_id) and rollback immediately
+        2. Query IBKR to check actual order status for positions with order_id
+        3. If FILLED: immediately call _on_fill_confirmed to update DB status → 'open'
+        4. If still PENDING: add to _pending_entries for polling to track
+        5. If CANCELLED/INACTIVE: log and mark as such
+
+        TASK-2026-XXX: Orphaned positions (pending_open with no order_id) are
+        detected and automatically rolled back during recovery to prevent them
+        from being stuck forever.
 
         This ensures the engine never loses track of pending orders across restarts.
         """
@@ -259,11 +264,36 @@ class AutoTraderEngine:
                 self.logger.info(
                     f"[RECOVERY] Found {len(pending_entries)} pending_open position(s) from prior session"
                 )
+
+                # First pass: detect and cleanup orphaned positions (no order_id)
+                orphaned_ids = []
+                for row in pending_entries:
+                    db_id = row[0]  # id
+                    order_id = row[44]  # order_id column index
+                    if not order_id:
+                        orphaned_ids.append(db_id)
+                        pos = _row_to_position(row)
+                        self.logger.warning(
+                            f"[RECOVERY] ORPHANED position detected: pos_id={db_id} | "
+                            f"{pos.side.value} {pos.ticker} {pos.short_strike}/{pos.long_strike} | "
+                            f"status=pending_open but no order_id — rolling back immediately"
+                        )
+                        # Rollback orphaned position
+                        self.store.rollback_position(db_id)
+
+                # Second pass: process positions with valid order_id
                 for row in pending_entries:
                     pos = _row_to_position(row)
                     order_id = row[44]  # order_id column index in positions table
+                    db_id = row[0]  # id
+
+                    # Skip orphaned positions already rolled back
+                    if db_id in orphaned_ids:
+                        continue
+
                     if not order_id:
-                        self.logger.warning(f"[RECOVERY] Skipping position {row[0]} — no order_id")
+                        # Should not reach here (handled in first pass), but safe-guard
+                        self.logger.warning(f"[RECOVERY] Skipping position {db_id} — no order_id")
                         continue
 
                     ts = row[6]  # open_time
