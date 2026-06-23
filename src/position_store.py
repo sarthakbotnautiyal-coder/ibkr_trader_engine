@@ -252,7 +252,11 @@ class PositionStore:
         init_db(self.db_path)
 
     def load_open(self) -> None:
-        """Load confirmed open positions from DB. Pending rows are loaded separately."""
+        """Load all open positions from DB, including pending_open entries.
+
+        TASK-2026-179: Must load both 'open' and 'pending_open' rows so that
+        in-flight entry orders are tracked for collision checking and exit signals.
+        """
         with get_conn(self.db_path) as conn:
             rows = get_open_positions(conn)
             self._positions = [
