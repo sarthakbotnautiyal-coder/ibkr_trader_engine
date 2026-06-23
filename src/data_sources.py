@@ -62,9 +62,9 @@ def verify_data_source() -> None:
 
     elif mode == "cloud":
         # Verify CLOUD mode credentials
-        app_id = CONFIG.get("supabase_app_id", "").strip()
+        app_id = os.getenv("SUPABASE_APP_ID", "").strip()
         if not app_id:
-            raise DataSourceError("CLOUD mode requires 'supabase_app_id' in config.yaml")
+            raise DataSourceError("CLOUD mode requires SUPABASE_APP_ID environment variable in .env")
 
         supabase_url = os.getenv("SUPABASE_URL", "").strip()
         if not supabase_url:
@@ -152,11 +152,11 @@ def get_supabase_client():
     except ImportError:
         raise DataSourceError("Supabase client not installed")
 
-    app_id = CONFIG.get("supabase_app_id", "")
+    app_id = os.getenv("SUPABASE_APP_ID", "")
     supabase_url = os.getenv("SUPABASE_URL", "")
 
     if not app_id or not supabase_url:
-        raise DataSourceError("Missing Supabase credentials")
+        raise DataSourceError("Missing Supabase credentials (SUPABASE_APP_ID and SUPABASE_URL in .env)")
 
     _SUPABASE_CLIENT = create_client(supabase_url, app_id)
     return _SUPABASE_CLIENT
