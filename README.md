@@ -1,6 +1,34 @@
 # IBKR Trader Engine — SPX 0DTE Auto-Trading System
 
-A sophisticated Python-based auto-trading engine for SPX 0DTE (zero days to expiration) options strategies with real-time risk management, technical analysis integration, and Telegram alerts.
+A Python-based auto-trading engine for SPX 0DTE (zero days to expiration) options strategies with real-time risk management, multi-source data integration, Telegram alerts, and optional Supabase cloud sync.
+
+## ⚡ Quick Start (5 Steps)
+
+```bash
+# 1. Clone + venv + deps
+cd /Users/ubexbot/.openclaw/workspace-venkat
+git clone <repo> ibkr_trader_engine && cd ibkr_trader_engine
+python3 -m venv venv && source venv/bin/activate
+pip install -r requirements.txt
+
+# 2. Configure credentials
+cp .env.example .env       # then edit .env with TELEGRAM_BOT_TOKEN, TELEGRAM_SIGNALS_CHAT_ID
+# Also update config/config.yaml: set ibkr.account_id, choose data_source_mode (local | cloud)
+
+# 3. Start required data sources (separate terminals)
+../gex_extractor/venv/bin/python3 ../gex_extractor/run.py
+../premium_extractor/venv/bin/python3 ../premium_extractor/run.py
+../tradingView_signal_generator/venv/bin/python3 ../tradingView_signal_generator/run.py
+
+# 4. Start TWS or IB Gateway on port 7497 (paper) or 4001 (live), with API enabled
+
+# 5. Run the engine (NOTE: must source .env manually — see "Running" section below)
+bash -c 'set -a && source ./.env && set +a && exec python3 run.py'
+```
+
+For dry-run mode (`dry_run: true` in `config/config.yaml`), no real money is risked. Start there.
+
+---
 
 ## 🎯 Features
 
@@ -12,44 +40,28 @@ A sophisticated Python-based auto-trading engine for SPX 0DTE (zero days to expi
 - ✅ **Telegram Alerts** — Real-time entry/exit/rejection notifications
 - ✅ **Comprehensive Logging** — Daily rotating logs by Eastern Time
 - ✅ **Backtesting** — Historical simulation with clock override
-- ✅ **Cloud Sync** — Optional Supabase dual-write for analytics
+- ✅ **Cloud Sync** — Optional Supabase dual-write for analytics (CLOUD mode)
+- ✅ **Auto-restart** — Watchdog pattern via cron (see "Running 24/7" below)
 
 ---
 
 ## 📋 Prerequisites
 
 ### System Requirements
-- **Python**: 3.9 or higher
+- **Python**: **3.10 or higher** (code uses PEP 604 union syntax: `str | None`)
 - **OS**: macOS, Linux (tested on macOS 14.x)
-- **Network**: Stable internet connection for IBKR, Discord, Telegram
+- **Network**: Stable internet connection for IBKR, Telegram
 
 ### Required Services
-1. **Interactive Brokers (IBKR)**
-   - TWS (Trader Workstation) or IB Gateway running
-   - Paper trading account (recommended for testing) or live account
-   - Default: `localhost:7497` (paper trading)
 
-2. **GEX Extractor** (sibling project)
-   - Polling Discord for gamma exposure data
-   - Writing to `../gex_extractor/data/gex.db`
-   - Must be running for engine to function
-
-3. **Premium Extractor** (sibling project)
-   - Scanning IBKR for option premiums
-   - Writing to `../premium_extractor/data/scanner.db`
-   - Must be running for engine to function
-
-4. **TradingView Signal Generator** (sibling project)
-   - Computing technical indicators (RSI, Bollinger Bands, MACD, ADX)
-   - Writing to `../tradingView_signal_generator/data/tradingview.db`
-   - Must be running for full feature set
-
-5. **Telegram** (for notifications)
-   - Your own Telegram bot (created via `@BotFather`)
-   - A Telegram group to receive alerts
+1. **Interactive Brokers (IBKR)** — TWS or IB Gateway, see "TWS API Setup" below
+2. **GEX Extractor** (sibling project) — writes GEX data to either `gex.db` (LOCAL) or Supabase `trading.gex_snapshots` (CLOUD)
+3. **Premium Extractor** (sibling project) — writes scanner data to either `scanner.db` (LOCAL) or Supabase `trading.scan_results` (CLOUD)
+4. **TradingView Signal Generator** (sibling project) — writes TV indicators to either `tradingview.db` (LOCAL) or Supabase `trading.trading_view_indicators` (CLOUD)
+5. **Telegram** — for entry/exit notifications (see "Telegram Bot Setup" below)
 
 ### Optional
-- **Supabase** — For cloud data archival and analytics
+- **Supabase** — for cloud data archival and cross-machine engine runs (see "Cloud Mode" below)
 
 ---
 
@@ -76,17 +88,27 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
+> **Note:** `requirements.txt` pins all required packages including `supabase==2.31.0` and `python-dotenv==1.0.1` for cloud mode and `.env` loading.
+
 ### Step 4: Verify Data Sources
 
-Ensure the required data source projects are accessible:
+Choose your data source mode (LOCAL or CLOUD) in `config/config.yaml`:
 
-```bash
-ls ../gex_extractor/data/gex.db              # Should exist
-ls ../premium_extractor/data/scanner.db      # Should exist
-ls ../tradingView_signal_generator/data/tradingview.db  # Should exist
+```yaml
+data_source_mode: "local"   # or "cloud" for Supabase
 ```
 
-If any are missing, start those extractors first (they create the DBs on first run).
+**For LOCAL mode** (default, simplest):
+
+```bash
+ls ../gex_extractor/data/gex.db                      # should exist
+ls ../premium_extractor/data/scanner.db              # should exist
+ls ../tradingView_signal_generator/data/tradingview.db  # should exist
+```
+
+If any are missing, start those extractors first (they create the DBs on first run). See "Starting the Data Extractors" below.
+
+**For CLOUD mode**: see "Cloud Mode (Supabase)" below.
 
 ---
 
@@ -94,577 +116,533 @@ If any are missing, start those extractors first (they create the DBs on first r
 
 ### Step 1: Environment Variables (`.env`)
 
-Copy the example and fill in your credentials:
-
 ```bash
 cp .env.example .env
+chmod 600 .env   # owner-only access
 ```
 
 Edit `.env`:
 
 ```bash
 # ========================
-# TELEGRAM NOTIFICATIONS
+# TELEGRAM NOTIFICATIONS (Required)
 # ========================
-
-# Your personal Telegram bot token (see "Telegram Bot Setup" below)
 TELEGRAM_BOT_TOKEN=123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11
-
-# Shared group chat ID (all friends post to the same group)
-# Format: -100 prefix for group, e.g., -1001234567890
 TELEGRAM_SIGNALS_CHAT_ID=-1001234567890
 
 # ========================
-# SUPABASE (Optional)
+# SUPABASE (Optional, only for CLOUD mode)
 # ========================
-
-# Uncomment if using cloud sync for dual-write to Supabase
-# SUPABASE_URL=https://your-project.supabase.co
-# SUPABASE_SECRET_KEY=your-secret-key
+SUPABASE_URL=https://your-project.supabase.co
+SUPABASE_APP_ID=sb_publishable_xxxx   # or sb_secret_xxxx for write access
 ```
 
 ### Step 2: Telegram Bot Setup
 
-**This step is required for notifications. Each friend creates their own bot.**
+1. Open Telegram, search `@BotFather`, send `/newbot`
+2. Follow prompts (bot name, unique username ending in `_bot`)
+3. Copy the token into `.env` as `TELEGRAM_BOT_TOKEN`
+4. Add the bot to your signal group and make it an **Admin** (required to post)
+5. Get the chat ID:
+   ```bash
+   # Send a test message in the group first, then:
+   curl -s "https://api.telegram.org/bot<YOUR_TOKEN>/getUpdates" | python3 -m json.tool
+   # Look for "chat":{"id":-100XXXXXXXXX,...}
+   ```
+6. Paste the chat ID into `.env` as `TELEGRAM_SIGNALS_CHAT_ID`
+7. Test:
+   ```bash
+   bash -c 'set -a && source ./.env && set +a && python3 -c "from src.telegram_notifier import send_telegram_message; print(send_telegram_message(\"test\"))"'
+   ```
 
-#### Create Your Bot (via @BotFather in Telegram)
+### Step 3: TWS API Setup
 
-1. Open Telegram and search for `@BotFather`
-2. Send `/newbot`
-3. Follow prompts:
-   - **Bot name**: E.g., "My SPX Trading Bot"
-   - **Username**: E.g., "my_spx_trading_bot" (must be unique, end with `_bot`)
-4. Copy the token: `123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11`
-5. Paste it into `.env` as `TELEGRAM_BOT_TOKEN`
+For TWS (Trader Workstation) or IB Gateway:
 
-#### Add Bot to Shared Group
+1. Open TWS, log in
+2. Go to **Edit → Global Configuration → API → Settings**
+3. Check **"Enable ActiveX and Socket Clients"**
+4. Set **Socket port** to match `config/config.yaml`:
+   - `7497` = paper trading
+   - `4001` = live trading
+5. **Uncheck** "Read-Only API" (engine needs to place orders)
+6. Add `127.0.0.1` to **Trusted IPs** (or `0.0.0.0/0` for any local client)
+7. Click **OK** and restart TWS for changes to take effect
 
-1. In Telegram, create or open the shared group (e.g., "SPX Trading Signals")
-2. Go to group info → **Add Members** → search and add your bot
-3. Go to group info → **Permissions** → make the bot an **Admin**
-   - This allows the bot to post messages to the group
-4. Get the group's chat ID:
-   - Send a test message in the group
-   - Open browser console and run:
-     ```javascript
-     // In Telegram's web app, open DevTools and run:
-     // The group ID is shown in the chat info
-     ```
-   - Or use this Python script to extract it:
-     ```bash
-     python3 -c "
-     import requests
-     token = '123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11'
-     url = f'https://api.telegram.org/bot{token}/getUpdates'
-     r = requests.get(url)
-     print(r.json())  # Look for chat_id in the response
-     "
-     ```
-   - Or retrieve from an existing message:
-     ```bash
-     curl -s "https://api.telegram.org/bot123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11/getUpdates" | python3 -m json.tool
-     ```
+### Step 4: Trading Configuration (`config/config.yaml`)
 
-5. Paste the group's chat ID into `.env` as `TELEGRAM_SIGNALS_CHAT_ID`
-
-#### Testing Telegram Connection
-
-```bash
-python3 -c "
-from src.telegram_notifier import send_telegram_message
-result = send_telegram_message('🧪 Test message from IBKR Engine')
-print(f'Message sent: {result}')
-"
-```
-
-Expected output: `Message sent: True` and a message appears in your Telegram group.
-
-### Step 3: Trading Configuration (`config/config.yaml`)
-
-The engine is pre-configured for SPX 0DTE trading. Key parameters:
+Key parameters to review:
 
 ```yaml
-# ========================
-# RUNNING MODE
-# ========================
-dry_run: true          # Set to false for LIVE TRADING with real orders
+# Run mode
+data_source_mode: "local"  # "local" or "cloud" (Supabase)
+dry_run: true              # CRITICAL: set to false ONLY after thorough testing
 
-# ========================
-# IBKR GATEWAY CONNECTION
-# ========================
+# IBKR connection
 ibkr:
   host: "127.0.0.1"
-  port: 7497           # 7497 = paper trading, 4001 = live trading
-  scanner_client_id: 15
-  spot_client_id: 16
-  engine_client_id: 31
-  account_id: "U13498586"  # Replace with your account ID
-  use_margin_limit: true
+  port: 7497               # 7497=paper, 4001=live
+  account_id: "U13498586"  # YOUR account ID
 
-# ========================
-# MARKET HOURS (ET)
-# ========================
+# Market hours (ET)
 market:
-  entry_start: "09:00"   # Stop taking new entries at 4 PM
-  entry_end: "16:00"
+  entry_start: "09:00"
+  entry_end: "16:00"       # stop taking new entries
 
-# ========================
-# ENTRY PARAMETERS
-# ========================
-entry:
-  spread_width_primary: 10    # 10-point spreads (4500/4510, 4510/4520)
-  spread_width_fallback: 20   # Fallback to 20-point if 10 unavailable
-  short_delta_target: 0.03    # Target 0.03 delta (~3% OTM)
-  contracts_per_trade: 1      # Number of contracts per trade
-  
-  vix_buckets:
-    13-16:
-      min_premium: 0.20       # Minimum credit required
-      rsi_upper_threshold: 50.0   # Don't enter if RSI above 50
-      rsi_lower_threshold: 49.0
-      distance:
-        from_spot: 3          # How far OTM from SPX spot
-        from_gex_level: 1     # Distance from GEX zero gamma level
-    16-20:
-      min_premium: 0.25
-      rsi_upper_threshold: 55.0
-      rsi_lower_threshold: 45.0
-      distance:
-        from_spot: 3
-        from_gex_level: 1.5
-    # ... more VIX buckets ...
-
-# ========================
-# DAY GATE (Volatility Protection)
-# ========================
-day_gate:
-  enabled: true
-  window_minutes: 15        # Rolling 15-min average
-  gex_by_oi_threshold: 0.0  # Block if GEX/OI below 0
-  spot_zero_gamma_threshold: -15.0  # Block if ZG below -15
-  rsi_extreme_low: 15.0     # Block if RSI below 15
-  rsi_extreme_high: 85.0    # Block if RSI above 85
-
-# ========================
-# ENGINE LOOP
-# ========================
-engine:
-  check_interval_seconds: 30  # Tick every 30 seconds
-
-# ========================
-# TELEGRAM NOTIFICATIONS
-# ========================
-telegram:
-  dry_run: false            # Set to true to log only (don't send Telegram)
-
-# ========================
-# DATA SOURCES
-# ========================
+# Data source paths (LOCAL mode only)
 data_sources:
   gex_db: "../gex_extractor/data/gex.db"
   scanner_db: "../premium_extractor/data/scanner.db"
   tradingview_db: "../tradingView_signal_generator/data/tradingview.db"
 ```
 
-**Important**: Before setting `dry_run: false`, thoroughly test in dry-run mode first.
+> ⚠️ **Before setting `dry_run: false`:** test in dry-run for at least 1 full trading day, verify all data sources are populated, and verify Telegram works.
 
 ---
 
 ## ▶️ Running the Engine
 
-### Dry-Run Mode (Recommended for First Test)
+### ⚠️ Important: `.env` is NOT auto-loaded by `run.py`
+
+`run.py` reads env vars directly from `os.environ`. Only the Supabase writers (`supabase_gex_writer.py`, `supabase_scanner_writer.py`) call `load_dotenv()`. You must source `.env` before running:
 
 ```bash
-# Ensure .env is populated and config has dry_run: true
-python3 run.py
-
-# Example output:
-# 2026-06-20 09:32:15 - engine - INFO - Engine starting (DRY_RUN mode)
-# 2026-06-20 09:32:16 - engine - INFO - Data sources connected
-# 2026-06-20 09:32:17 - engine - INFO - Listening for ticks... (tick interval: 30 sec)
+bash -c 'set -a && source ./.env && set +a && exec python3 run.py'
 ```
 
-In dry-run mode:
-- ✅ Positions are tracked in `data/positions.db`
-- ✅ Entry/exit decisions logged to console and logs
-- ✅ Telegram messages logged (not sent) if `telegram.dry_run: true`
-- ✅ **NO REAL ORDERS** placed with IBKR
+This exports all `.env` vars to the shell environment, then `exec` replaces the shell with Python (so the engine inherits them).
 
-### Live Mode (Real Trading)
+### Run Modes
 
-⚠️ **Before going live:**
-1. ✅ Tested dry-run mode for at least 1 full trading day
-2. ✅ Verified all data sources are running and populated
-3. ✅ Verified Telegram notifications work
-4. ✅ Confirmed IBKR account is funded and connected
-5. ✅ Reviewed all trading parameters in `config/config.yaml`
+#### Smoke test (no IBKR connection, no trading)
+```bash
+bash -c 'set -a && source ./.env && set +a && python3 run.py --test'
+```
+Verifies config loads, all data sources are reachable, and Supabase (if CLOUD) credentials work. No orders, no IBKR connection.
+
+#### Dry-run mode (real data, no real orders)
+```bash
+# config/config.yaml: dry_run: true
+bash -c 'set -a && source ./.env && set +a && python3 run.py'
+```
+- ✅ All signals generated, positions tracked in `data/positions.db`
+- ✅ Entry/exit decisions logged to console and `logs/engine.YYYY-MM-DD.log`
+- ✅ Telegram messages sent
+- ✅ **No real orders** placed with IBKR
+
+#### Live mode (real trading)
+```bash
+# config/config.yaml: dry_run: false
+bash -c 'set -a && source ./.env && set +a && python3 run.py'
+```
+⚠️ **Trades real positions with real money.** Start with `contracts_per_trade: 1`.
+
+#### Backtest mode (replay historical data)
+```bash
+bash -c 'set -a && source ./.env && set +a && python3 -m src.backtest --date 2026-05-15'
+bash -c 'set -a && source ./.env && set +a && python3 -m src.backtest --date 2026-05-15 --verbose'
+bash -c 'set -a && source ./.env && set +a && python3 -m src.backtest --date 2026-05-15 --summary-only'
+```
+- **LOCAL mode only** — backtest reads from `gex.db`, `scanner.db`, `tradingview.db`
+- **DRY_RUN forced** — no real trades even in live config
+- Results written to `data/backtest.db` (tables: `backtest_signals`, `backtest_positions`)
+- `--run-id YYYY-MM-DD_custom` lets you save multiple runs per date
+- 0DTE expiry: any still-open positions at end of run are marked `status='expired'` with `exit_reason='expired_0dte'`
+
+### Starting the Data Extractors
+
+Before running the engine, start the three sibling extractors (each in its own terminal or via the watchdog pattern):
 
 ```bash
-# Set in config/config.yaml:
-# dry_run: false
-
+# Terminal 1: GEX extractor
+cd /Users/ubexbot/.openclaw/workspace-venkat/gex_extractor
+source venv/bin/activate
 python3 run.py
 
-# Example output:
-# 2026-06-20 09:30:00 - engine - INFO - Engine starting (LIVE mode)
-# 2026-06-20 09:32:15 - engine - INFO - [LIVE] 🚀 ENTRY | CALL | 4500/4510 | $2.80 credit
-# 2026-06-20 14:45:32 - engine - INFO - [LIVE] ✅ EXIT | CALL | 4500/4510 | P&L: +$280 | L1 crossed
+# Terminal 2: Premium extractor
+cd /Users/ubexbot/.openclaw/workspace-venkat/premium_extractor
+source venv/bin/activate
+python3 run.py
+
+# Terminal 3: TradingView signal generator
+cd /Users/ubexbot/.openclaw/workspace-venkat/tradingView_signal_generator
+source venv/bin/activate
+python3 run.py
 ```
 
-Live mode trades real positions with real money. **Start small** and monitor carefully.
+> The `run-extractor.sh` watchdog (in `../scripts/`) auto-restarts these via cron every 5 minutes. See "Running 24/7" below.
+
+### Running 24/7 (Auto-Restart)
+
+For a production setup, use the watchdog pattern (already used for the extractors):
+
+```bash
+# Create a watchdog script: /Users/ubexbot/.openclaw/scripts/ibkr-engine-watchdog.sh
+#!/bin/bash
+PIDFILE=/Users/ubexbot/.openclaw/workspace-venkat/ibkr_trader_engine/run.pid
+if [ -f "$PIDFILE" ] && kill -0 $(cat "$PIDFILE") 2>/dev/null; then
+  exit 0
+fi
+cd /Users/ubexbot/.openclaw/workspace-venkat/ibkr_trader_engine
+nohup bash -c 'set -a && source ./.env && set +a && exec /opt/homebrew/bin/python3 run.py' \
+  >> logs/engine_$(date +%Y-%m-%d).log 2>&1 < /dev/null &
+echo $! > "$PIDFILE"
+```
+
+Add to crontab (`crontab -e`):
+```cron
+@reboot /Users/ubexbot/.openclaw/scripts/ibkr-engine-watchdog.sh
+*/5 * * * * /Users/ubexbot/.openclaw/scripts/ibkr-engine-watchdog.sh
+```
+
+---
+
+## ☁️ Cloud Mode (Supabase)
+
+CLOUD mode reads from Supabase instead of local SQLite. Useful when:
+- Running the engine on a different machine from the extractors
+- Wanting shared state across multiple engine instances
+- Backing up data for analytics
+
+### Setup
+
+1. **Create a Supabase project** at https://supabase.com (free tier is enough for a few months)
+
+2. **Create the schema and tables** in the Supabase SQL editor:
+   ```sql
+   CREATE SCHEMA IF NOT EXISTS trading;
+   
+   CREATE TABLE trading.gex_snapshots (
+     id BIGSERIAL PRIMARY KEY,
+     ticker TEXT NOT NULL,
+     captured_at TIMESTAMPTZ NOT NULL,
+     -- ... other columns matching gex_extractor schema
+   );
+   
+   CREATE TABLE trading.scan_results (
+     id BIGSERIAL PRIMARY KEY,
+     ticker TEXT NOT NULL,
+     captured_at TIMESTAMPTZ NOT NULL,
+     -- ... other columns matching premium_extractor schema
+   );
+   
+   CREATE TABLE trading.trading_view_indicators (
+     id BIGSERIAL PRIMARY KEY,
+     ticker TEXT NOT NULL,
+     captured_at TIMESTAMPTZ NOT NULL,
+     -- ... other columns matching TradingView signal generator schema
+   );
+   ```
+   (Full schema: see sibling extractor `supabase_*_writer.py` files for the exact column list.)
+
+3. **Get your credentials** from Supabase dashboard → Settings → API:
+   - **Project URL** → `SUPABASE_URL`
+   - **Publishable key** (`sb_publishable_...`) → `SUPABASE_APP_ID`
+   - **Secret key** (`sb_secret_...`) → for extractors writing to Supabase
+
+4. **Configure extractors** to write to Supabase: add the same `SUPABASE_URL` and `SUPABASE_SECRET_KEY` to each extractor's `.env` file. Each extractor's `supabase_*_writer.py` will auto-detect these and dual-write.
+
+5. **Configure engine** to read from Supabase:
+   ```yaml
+   # config/config.yaml
+   data_source_mode: "cloud"
+   ```
+   And in `.env`:
+   ```bash
+   SUPABASE_URL=https://your-project.supabase.co
+   SUPABASE_APP_ID=sb_publishable_xxxx
+   ```
+
+6. **Test** the connection:
+   ```bash
+   bash -c 'set -a && source ./.env && set +a && python3 run.py --test'
+   ```
+   If credentials are wrong, the test will fail with `DataSourceError: CLOUD mode requires SUPABASE_APP_ID environment variable`.
+
+### Local ↔ Cloud Switching
+
+You can switch modes by changing `data_source_mode` and restarting. Local data is not lost — CLOUD mode just ignores local `.db` files.
 
 ---
 
 ## 📊 Monitoring & Logs
 
-### Real-Time Console Output
+### Real-Time Console
 
 ```bash
-tail -f logs/engine*.log
-
-# Filter for entries/exits only
-tail -f logs/engine*.log | grep -E "ENTRY|EXIT|DAY_GATE"
-
-# Filter for errors
-tail -f logs/engine*.log | grep -i error
-```
-
-### Log File Locations
-
-Logs are written daily by Eastern Time:
-
-```bash
-logs/
-├── engine.2026-06-20.log       # Today's engine log
-├── engine.2026-06-19.log       # Yesterday's engine log
-└── ...
+tail -f logs/engine.$(date +%Y-%m-%d).log
+tail -f logs/engine.$(date +%Y-%m-%d).log | grep -E "ENTRY|EXIT|DAY_GATE"
+tail -f logs/engine.$(date +%Y-%m-%d).log | grep -i error
 ```
 
 ### Key Log Patterns
 
-**Entry Signal:**
+**Entry signal:**
 ```
 [LIVE] 🚀 ENTRY | CALL | 4500/4510 | $2.80 credit | 1 contract | SPX=4500 | EM=15.0 | fill=$2.80
 ```
 
-**Exit Signal:**
+**Exit signal:**
 ```
-[LIVE] ✅ EXIT | CALL | 4500/4510 | 1 contract | P&L: +$280 | L1 crossed | SPX=4510 | L1
+[LIVE] ✅ EXIT | CALL | 4500/4510 | 1 contract | P&L: +$280 | L1 crossed
 ```
 
-**Day Gate Alert:**
+**Day gate:**
 ```
 🚨 DAY GATE BLOCKED | 2026-06-20 13:45:00 ET
 New entries suspended — danger signals fired:
   GEX-OI=-2.5 ❌  |  Dist=0.8 ❌  |  RSI=88.0 ❌  (n=3 ticks)
 ```
 
-**Dry-Run Telegram Log:**
-```
-[TELEGRAM DRY] [LIVE] 🚀 ENTRY | CALL | 4500/4510 | $2.80 credit | 1 contract
-```
-
 ### Position Tracking
 
-View current positions in the SQLite database:
-
 ```bash
+# Open positions
 sqlite3 data/positions.db "SELECT * FROM positions WHERE status='open';"
+
+# Recent trades
 sqlite3 data/positions.db "SELECT * FROM trades ORDER BY entry_ts DESC LIMIT 10;"
+
+# Backtest results
+sqlite3 data/backtest.db "SELECT * FROM backtest_positions WHERE run_id='2026-05-15';"
 ```
 
 ---
 
-## 🤝 Sharing with Friends
+## 🏗️ Architecture Overview
 
-All friends can run the same engine code and trade into a **shared Telegram group**.
-
-### Setup for Each Friend
-
-1. **Get your own Telegram bot** (create via `@BotFather`)
-   - Each friend creates their own unique bot
-   - Get your `TELEGRAM_BOT_TOKEN`
-
-2. **Add your bot to the shared group**
-   - E.g., group "SPX Trading Signals"
-   - Make your bot an admin
-
-3. **Use the shared group chat ID**
-   - All friends use the **same** `TELEGRAM_SIGNALS_CHAT_ID` (the group's ID)
-   - This is the only value you share
-
-4. **Copy `.env.example` → `.env`** and fill in:
-   ```bash
-   TELEGRAM_BOT_TOKEN=<your_personal_bot_token>
-   TELEGRAM_SIGNALS_CHAT_ID=<shared_group_chat_id>
-   ```
-
-### Shared Telegram Group Example
-
-When all friends are running:
+### Components
 
 ```
-SPX Trading Signals
-
-[LIVE] [Your Bot] 🚀 ENTRY | CALL | 4500/4510 | $2.80 credit
-[LIVE] [Friend1 Bot] ✅ EXIT | CALL | 4505/4515 | P&L: +$250
-[LIVE] [Friend2 Bot] 🚀 ENTRY | PUT | 4490/4480 | $1.50 credit
-🚨 [Your Bot] DAY GATE BLOCKED | GEX signals fired
+src/
+├── engine.py                   # Main event loop, orchestration
+├── risk_manager.py             # Entry/exit logic, VIX-adaptive parameters
+├── day_gate.py                 # Volatility protection (GEX, RSI, distance)
+├── position_store.py           # Open position tracking (SQLite)
+├── executor.py                 # Order execution, fill confirmation
+├── trades_db.py                # Trade history database
+├── blocking_ib_client.py       # IBKR Gateway communication (blocking API)
+├── telegram_notifier.py        # Telegram message sending
+│
+├── combined_reader.py          # Multi-source data orchestrator
+│   ├── LocalSource             # reads from local SQLite DBs
+│   └── CloudSource             # reads from Supabase
+├── data_sources.py             # Supabase client, CLOUD mode helpers
+├── gex_reader.py               # Read GEX snapshots from gex.db
+├── scanner_reader.py           # Read option premiums from scanner.db
+├── tradingview_reader.py       # Read technical indicators from tradingview.db
+│
+├── supabase_gex_writer.py      # Dual-write gex.db → Supabase (used by gex_extractor)
+├── supabase_scanner_writer.py  # Dual-write scanner.db → Supabase (used by premium_extractor)
+│
+├── backtest.py                 # Historical replay (--date 2026-05-15)
+├── backtest_db.py              # Backtest result storage
+├── backtests_db.py             # Backtest metadata
+│
+├── tick_processor.py           # Per-tick entry/exit evaluation
+├── contracts.py                # SPX options contract definitions
+│
+├── log_setup.py                # Logging config (daily ET rotation)
+└── config/                     # config package (loads config.yaml)
+    ├── __init__.py
+    └── config.yaml
 ```
 
-Each bot is visually distinct (different names, avatars), so you can see who's trading.
+### Data Flow (LOCAL mode)
 
-### Distributing the Project
-
-Create a package for your friends:
-
-```bash
-# Create distribution folder
-mkdir -p ~/ibkr_trader_engine_distribution
-
-# Copy project files (excluding sensitive data)
-cp -r . ~/ibkr_trader_engine_distribution/
-cd ~/ibkr_trader_engine_distribution
-
-# Remove sensitive files
-rm .env                  # Don't share your credentials
-rm -rf .git/config      # Don't share git config
-rm -rf data/*.db        # Don't share databases
-rm -rf logs/*.log       # Don't share logs
-
-# Keep example files for friends to fill in
-ls -la .env.example     # ✅ Friends will copy this
+```
+Market Open (9:30 AM ET)
+  ↓
+Engine starts: run.py → AutoTraderEngine.run()
+  ↓
+Load config (config/config.yaml) + .env (must be sourced manually)
+  ↓
+Connect to IBKR Gateway (blocking_ib_client.py on 127.0.0.1:7497)
+  ↓
+Every 30 seconds (tick loop):
+  ├─ LocalSource.get_combined_for_latest_scan() → gex.db + scanner.db + tradingview.db
+  ├─ Day gate check (day_gate.py)
+  ├─ Entry decision (risk_manager.py)
+  ├─ Place order (executor.py) → IBKR
+  ├─ Poll for fill (executor.py)
+  ├─ Send Telegram alert (telegram_notifier.py)
+  └─ Update position tracking (position_store.py, trades_db.py)
+  ↓
+Market Close (4:00 PM ET)
+  ↓
+Log final positions, close connections, exit
 ```
 
-**Instructions to send friends:**
+### Data Flow (CLOUD mode)
 
-```markdown
-## Setup Instructions
+Identical to LOCAL, except `combined_reader` returns `CloudSource` which reads from `trading.gex_snapshots`, `trading.scan_results`, `trading.trading_view_indicators` in Supabase.
 
-1. Clone or extract the project
-2. Create virtual environment: `python3 -m venv venv && source venv/bin/activate`
-3. Install deps: `pip install -r requirements.txt`
-4. Create your Telegram bot (see README.md "Telegram Bot Setup")
-5. Copy `.env.example` → `.env` and fill in your bot token + shared group chat ID
-6. Update `config/config.yaml` with your IBKR account ID
-7. Run in dry-run mode first: `python3 run.py` (with dry_run: true in config)
-8. Once comfortable, set dry_run: false and run again
-9. Watch logs: `tail -f logs/engine*.log`
+### Key Decisions per Tick
 
-Questions? See "Troubleshooting" section in README.md
-```
+1. **Day Gate**: Are market conditions safe? (GEX, RSI, distance thresholds)
+2. **VIX Bucket**: Which parameters to use? (VIX 13-16, 16-20, 20-25, 25-30)
+3. **Premium Scan**: Are available spreads above minimum credit?
+4. **RSI Gate**: Is RSI in safe range for this VIX bucket?
+5. **Distance Check**: Is strike far enough from spot / GEX zero-gamma level?
+6. **Entry Decision**: Place order or skip?
+7. **Exit Decision**: For open positions, should we close?
+8. **Risk Limits**: Margin limit, max position count
 
 ---
 
 ## 🔍 Troubleshooting
 
-### IBKR Connection Issues
+### IBKR Connection
 
-**Error**: `Connection refused: 127.0.0.1:7497`
+**Error: `Connection refused: 127.0.0.1:7497`**
+- ✅ Start TWS or IB Gateway
+- ✅ Verify port: paper=7497, live=4001
+- ✅ TWS: Edit → Global Configuration → API → Settings → "Enable ActiveX and Socket Clients" + correct port
+- ✅ Add 127.0.0.1 to Trusted IPs
+- ✅ UNCHECK "Read-Only API" (engine needs to place orders)
 
-- ✅ Start TWS (Trader Workstation) or IB Gateway
-- ✅ Check port: Paper trading = 7497, Live = 4001
-- ✅ Verify in config: `ibkr.port: 7497`
-- ✅ Check IBKR settings: Enable API connections
+### Data Source Missing (LOCAL mode)
 
-### Data Source Missing
-
-**Error**: `FileNotFoundError: ../gex_extractor/data/gex.db`
-
-- ✅ Start `gex_extractor/run.py` in a separate terminal
-- ✅ Wait 1-2 minutes for it to populate data
+**Error: `FileNotFoundError: ../gex_extractor/data/gex.db`**
+- ✅ Start that extractor: `../gex_extractor/venv/bin/python3 ../gex_extractor/run.py`
+- ✅ Wait 1-2 minutes for first DB write
 - ✅ Verify: `ls -lh ../gex_extractor/data/gex.db`
 - ✅ Repeat for `premium_extractor` and `tradingView_signal_generator`
 
-### Telegram Notifications Not Working
+### Cloud Mode Errors
 
-**Error**: `[TELEGRAM] TELEGRAM_BOT_TOKEN not set`
+**Error: `DataSourceError: CLOUD mode requires SUPABASE_APP_ID`**
+- ✅ Check `.env` has `SUPABASE_APP_ID=sb_publishable_...` (or `sb_secret_...`)
+- ✅ Source `.env` before running: `bash -c 'set -a && source ./.env && set +a && exec python3 run.py'`
 
-- ✅ Check `.env` has `TELEGRAM_BOT_TOKEN=...` (not empty)
-- ✅ Source `.env` before running: It's auto-loaded by `run.py`
-- ✅ Test connection: `python3 -c "from src.telegram_notifier import send_telegram_message; send_telegram_message('test')"`
-- ✅ Check bot is admin in group: Go to group info → Members → Bot permissions
+**Error: Supabase returns 401 / 404 / 403**
+- ✅ Verify the project URL and key are correct (no typos)
+- ✅ If the key is `sb_publishable_...`, the publishable key only works for anon read. For CLOUD mode reads of the engine, that's enough. If extractors are writing, they need `sb_secret_...`.
+- ✅ Verify the tables exist: in Supabase SQL editor, run `SELECT COUNT(*) FROM trading.gex_snapshots;`
 
-**Error**: `[TELEGRAM] API error: {'ok': False, 'error_code': 400, 'description': 'Bad Request: chat_id invalid'}`
+### Telegram Not Working
 
-- ✅ Verify `TELEGRAM_SIGNALS_CHAT_ID` is correct (format: `-1001234567890`)
-- ✅ Verify bot was added to group and is admin
-- ✅ Try manually sending message via bot: `curl -X POST "https://api.telegram.org/bot<TOKEN>/sendMessage?chat_id=<ID>&text=test"`
+**Error: `[TELEGRAM] TELEGRAM_BOT_TOKEN not set`**
+- ✅ Check `.env` has `TELEGRAM_BOT_TOKEN=...`
+- ✅ **Source `.env` manually** — `run.py` does NOT auto-load it
+- ✅ Use: `bash -c 'set -a && source ./.env && set +a && exec python3 run.py'`
 
-### Database Lock Issues
+**Error: `400 Bad Request: chat_id invalid`**
+- ✅ Verify `TELEGRAM_SIGNALS_CHAT_ID` is correct (format: `-100XXXXXXXXXX`)
+- ✅ Verify bot is added to the group AND is an Admin
 
-**Error**: `sqlite3.OperationalError: database is locked`
+### Stale Data (Engine Says "Skipping entry — no GEX in 10min window")
 
+- ✅ Check the extractors are running: `pgrep -fl gex_extractor.*run.py`
+- ✅ Check the extractors are writing: `ls -la ../gex_extractor/data/gex.db`
+- ✅ For CLOUD mode: `SELECT MAX(captured_at) FROM trading.gex_snapshots;` should be within last 10 minutes during market hours
+
+### Database Lock
+
+**Error: `sqlite3.OperationalError: database is locked`**
 - ✅ Close other instances reading the same DB
-- ✅ Ensure WAL mode is enabled (it should be by default)
-- ✅ Restart the engine
+- ✅ Engine uses WAL mode (should not conflict with extractors, but check)
 
-### High CPU/Memory Usage
+### High CPU / Memory
 
-- ✅ Check tick interval in config: `engine.check_interval_seconds: 30`
-- ✅ Reduce if needed (higher = more responsive, more CPU)
+- ✅ Adjust `engine.check_interval_seconds` in config (default 30s)
 - ✅ Monitor: `top -p $(pgrep -f "python3 run.py")`
 
 ### Trades Not Executing
 
 **In dry-run mode** (expected):
-- ✅ Check logs for `[DRY_RUN]` tag on entry/exit messages
-- ✅ Verify `dry_run: true` in config
+- Check for `[DRY_RUN]` tag in entry/exit messages
+- Confirm `dry_run: true` in config
 
 **In live mode** (troubleshoot):
-- ✅ Verify order placement: Check TWS for pending orders
-- ✅ Check risk manager gates: `entry_start` and `entry_end` market hours
-- ✅ Check day gate status: Look for `DAY GATE BLOCKED` in logs
-- ✅ Verify IBKR account margin: Account must have available buying power
-- ✅ Check for order rejections: Search logs for `REJECTED`
-
----
-
-## 📚 Architecture Overview
-
-### Core Components
-
-```
-src/
-├── engine.py                 # Main event loop, decision orchestration
-├── risk_manager.py           # Entry/exit logic, VIX-adaptive parameters
-├── day_gate.py               # Volatility protection (GEX, RSI, distance)
-├── position_store.py         # Open position tracking
-├── executor.py               # Order execution, fill confirmation
-├── trades_db.py              # Trade history database
-├── blocking_ib_client.py     # IBKR Gateway communication (blocking API)
-├── telegram_notifier.py      # Telegram message sending
-│
-├── gex_reader.py             # Read GEX snapshots from gex.db
-├── scanner_reader.py         # Read option premiums from scanner.db
-├── tradingview_reader.py     # Read technical indicators from tradingview.db
-├── combined_reader.py        # Orchestrate multi-source data reads
-│
-├── log_setup.py              # Logging configuration (daily ET rotation)
-├── config.py                 # Config loading from config.yaml
-└── schema.py                 # Position/trade data structures
-```
-
-### Data Flow
-
-```
-Market Open (9:30 AM ET)
-    ↓
-Engine starts: engine.py __main__
-    ↓
-Load config (config.yaml) + environment (.env)
-    ↓
-Connect to IBKR Gateway (blocking_ib_client.py)
-    ↓
-Every 30 seconds (tick loop):
-    ├─ Read GEX snapshot (gex_reader.py ← gex.db)
-    ├─ Read scan results (scanner_reader.py ← scanner.db)
-    ├─ Read TV indicators (tradingview_reader.py ← tradingview.db)
-    ├─ Combine data (combined_reader.py)
-    ├─ Check day gate (day_gate.py)
-    ├─ Make entry decision (risk_manager.py)
-    ├─ Place order (executor.py) → IBKR
-    ├─ Poll for fill (executor.py)
-    ├─ Send Telegram alert (telegram_notifier.py)
-    └─ Update position tracking (position_store.py, trades_db.py)
-    ↓
-Market Close (4:00 PM ET)
-    ↓
-Log final positions, close connections, exit
-```
-
-### Key Decisions per Tick
-
-1. **Day Gate Check**: Are market conditions safe to enter?
-2. **VIX Bucket**: Which parameters to use (VIX 13-16, 16-20, etc.)?
-3. **Premium Scan**: Are available spreads above minimum credit?
-4. **RSI Gate**: Is RSI in safe range?
-5. **Distance Check**: Is strike far enough from spot/GEX level?
-6. **Entry Decision**: Place order or skip?
-7. **Exit Decision**: For open positions, should we close?
-8. **Risk Limits**: Are we below margin limit and max position count?
+- Check TWS for pending orders
+- Check risk manager: `entry_start` / `entry_end` market hours
+- Look for `DAY GATE BLOCKED` in logs
+- Verify IBKR buying power
+- Search logs for `REJECTED`
 
 ---
 
 ## 🔐 Security & Best Practices
 
 ### Environment Variables
-
-- ✅ Store in `.env` (gitignored)
+- ✅ Store in `.env` (gitignored, permissions 600)
 - ✅ Never commit `.env` to git
 - ✅ Never share `.env` with others
-- ✅ Use separate bot tokens per person (one token per friend)
-- ✅ Rotate tokens periodically if compromised
+- ✅ Use unique bot tokens per machine
 
 ### Paper vs. Live
-
-- ✅ Start in **paper trading** (port 7497, `ibkr.port`)
-- ✅ Test for at least 5 trading days
-- ✅ Only move to **live trading** (port 4001) when confident
+- ✅ Start in **paper** (port 7497) for at least 5 trading days
+- ✅ Only move to **live** (port 4001) when confident
 - ✅ Even in live, start with `contracts_per_trade: 1`
-- ✅ Scale up position size gradually after profitability confirmed
+- ✅ Scale position size gradually after profitability confirmed
 
 ### Risk Management
-
 - ✅ Day gate enabled (blocks entries in volatile markets)
-- ✅ Margin limits enforced (check account buying power)
-- ✅ Position limits (e.g., max 3 concurrent positions)
-- ✅ Daily P&L stop-loss (optional: stop trading if drawdown threshold hit)
-- ✅ Manual kill switch: Set `dry_run: true` to halt real trading
+- ✅ Margin limits enforced (check buying power)
+- ✅ Position limits (max concurrent positions)
+- ✅ Manual kill switch: set `dry_run: true` to halt real trading
 
 ### Monitoring
-
-- ✅ Watch logs during market hours
-- ✅ Monitor Telegram alerts in real-time
+- ✅ Watch logs during market hours: `tail -f logs/engine.$(date +%Y-%m-%d).log`
+- ✅ Monitor Telegram alerts
 - ✅ Check TWS for pending/filled orders
-- ✅ Verify positions at market close
-- ✅ Review trade log daily: `sqlite3 data/positions.db "SELECT * FROM trades WHERE DATE(entry_ts)='2026-06-20';"`
+- ✅ Review trade log daily
 
 ---
 
-## 📖 Additional Resources
+## 📖 References
 
-- **IBKR API**: https://ibkr.com/api
+- **IBKR API docs**: https://ibkr.com/api
 - **Telegram Bot API**: https://core.telegram.org/bots/api
-- **Config Reference**: See `config/config.yaml` for all parameters
-- **Data Schema**: See `src/schema.py` for position/trade structures
-- **Logging**: Logs rotate daily by Eastern Time in `logs/`
+- **Supabase docs**: https://supabase.com/docs
+- **Config reference**: `config/config.yaml` (all parameters)
+- **Position/trade schema**: `src/schema.py`
+- **Sibling extractors**:
+  - `../gex_extractor/`
+  - `../premium_extractor/`
+  - `../tradingView_signal_generator/`
 
 ---
 
 ## 📞 Support
 
-### Before Asking for Help
-
-1. ✅ Check logs: `tail -f logs/engine*.log | grep -i error`
-2. ✅ Verify all data sources running: `ls -lh ../*/data/*.db`
-3. ✅ Verify IBKR connection: TWS/IB Gateway running on correct port
-4. ✅ Verify Telegram setup: Bot in group + admin permissions
-5. ✅ Test dry-run mode first: `dry_run: true` in config
+Before asking:
+1. ✅ Check logs: `tail -f logs/engine.$(date +%Y-%m-%d).log | grep -i error`
+2. ✅ Verify data sources running: `pgrep -fl "../gex_extractor\|../premium_extractor\|../tradingView"`
+3. ✅ Verify IBKR: TWS running on correct port, API enabled
+4. ✅ Verify Telegram: bot in group + admin
+5. ✅ Test dry-run first: `dry_run: true` in config
 
 ### Common Questions
 
-**Q: Can I run multiple instances of the engine?**
-- A: Not recommended — they'll compete for orders on same strikes. Use separate accounts/groups if needed.
+**Q: Can I run multiple engines?**
+A: Not recommended — they'll compete for orders on same strikes. Use separate accounts.
 
 **Q: What's the minimum VIX for trading?**
-- A: Configured per VIX bucket. Default: 13-16, 16-20, 20-25, 25-30. Adjust in `config/config.yaml`.
+A: Configured per VIX bucket. Default: 13-16, 16-20, 20-25, 25-30. Adjust in `config/config.yaml`.
 
 **Q: How do I backtest?**
-- A: Use: `python3 run.py --backtest 2026-06-15`. Requires historical DB data.
+A: `python3 -m src.backtest --date 2026-05-15`. LOCAL mode only. Results in `data/backtest.db`.
 
 **Q: What if IBKR connection drops during market hours?**
-- A: Engine will auto-reconnect (logging attempts). Open positions remain in database.
+A: Engine will auto-reconnect. Open positions remain in database. Watchdog will restart if process dies.
 
-**Q: How do I calculate P&L?**
-- A: Database stores entry price, exit price, contracts. P&L = (exit - entry) × contracts × 100.
+**Q: P&L calculation?**
+A: `(exit_price - entry_price) × contracts × 100` for credit spreads.
+
+**Q: Can I run the engine on a different machine than the extractors?**
+A: Yes — use CLOUD mode. Extractors write to Supabase, engine reads from Supabase.
+
+**Q: How do I add a new VIX bucket?**
+A: Edit `config/config.yaml` `entry.vix_buckets` and add a new entry. Restart the engine.
 
 ---
 
 ## 📝 Version History
 
-- **v1.0** (2026-06-20): Initial release with EST timezone awareness, multi-source data readers, and Telegram integration
-- **v0.9** (2026-06-15): Beta release with core trading logic and IBKR integration
+- **v1.1** (2026-06-23): CLOUD mode (Supabase), backtest improvements, watchdog support, updated README
+- **v1.0** (2026-06-20): Initial release with EST timezone awareness, multi-source data readers, Telegram integration
 
 ---
 
