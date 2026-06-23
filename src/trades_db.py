@@ -503,8 +503,13 @@ def update_position_exit_snapshot(
 
 
 def get_open_positions(conn: sqlite3.Connection) -> list[Position]:
+    """Load all active positions: both 'open' (confirmed fills) and 'pending_open' (in-flight entries).
+
+    TASK-2026-179: Must include pending_open so that after restart, in-flight orders
+    are tracked for collision checking and exit signal processing.
+    """
     rows = conn.execute(
-        "SELECT * FROM positions WHERE status = 'open' ORDER BY open_time DESC"
+        "SELECT * FROM positions WHERE status IN ('open', 'pending_open') ORDER BY open_time DESC"
     ).fetchall()
     return [_row_to_position(r) for r in rows]
 
