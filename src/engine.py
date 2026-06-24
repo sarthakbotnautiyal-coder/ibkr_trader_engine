@@ -721,7 +721,12 @@ class AutoTraderEngine:
         )
 
         # TASK-2026-179: Telegram fires ONLY after confirmed fill (via polling)
-        side_val = params.contract_type if hasattr(params, 'contract_type') else decision.side
+        if hasattr(params, 'contract_type') and params.contract_type:
+            side_val = params.contract_type
+        elif pos_for_pnl:
+            side_val = pos_for_pnl.side.value if hasattr(pos_for_pnl.side, 'value') else pos_for_pnl.side
+        else:
+            side_val = "UNKNOWN"
         notify_exit(
             side=side_val,
             short_strike=pos_for_pnl.short_strike if pos_for_pnl else params.strike,
