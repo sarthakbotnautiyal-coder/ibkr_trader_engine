@@ -682,7 +682,6 @@ class AutoTraderEngine:
         # Compute actual P&L using original credit and actual close debit
         # P&L = (original_credit * 100 * contracts) - (close_debit * 100 * contracts)
         # Original credit was collected at entry; close debit is what we paid to close
-        original_credit = decision.credit  # credit received when spread was opened
         close_debit = abs(avg_price)  # what we paid to buy back the spread
         contracts = int(filled)
 
@@ -694,6 +693,7 @@ class AutoTraderEngine:
                 break
 
         if pos_for_pnl is not None:
+            original_credit = pos_for_pnl.credit  # credit received when spread was opened
             pnl = (original_credit - close_debit) * 100 * contracts
         else:
             pnl = 0.0
