@@ -463,7 +463,12 @@ class CloudSource(BaseSource):
     """CLOUD mode — read from Supabase via the data_sources abstraction."""
 
     def _in_window(self, rows: list[dict], scan_ts: str, ts_key: str) -> list[dict]:
-        """Filter cloud rows to the 10-min as-of window, newest-first."""
+        """Filter cloud rows to the 10-min as-of window, newest-first.
+
+        Handles both timezone-aware and naive timestamps by normalizing to naive
+        ET for comparison. Timestamps with timezone info are converted to ET before
+        stripping the zone; naive timestamps are assumed to already be ET.
+        """
         win_start = _window_start_dt(scan_ts)
         upper = datetime.strptime(_parse_ts(scan_ts).split('.')[0], "%Y-%m-%d %H:%M:%S")
         out = []
@@ -472,7 +477,32 @@ class CloudSource(BaseSource):
             if not raw:
                 continue
             try:
-                dt = datetime.strptime(_parse_ts(str(raw)).split('.')[0], "%Y-%m-%d %H:%M:%S")
+                raw_str = str(raw).strip()
+                # Try to parse as ISO 8601 with timezone info
+                # Examples: "2026-06-24T14:10:20Z", "2026-06-24T14:10:20+00:00", "2026-06-24T10:10:20-04:00"
+                try:
+                    from datetime import timezone as tz_module
+                    # Remove fractional seconds for consistent parsing
+                    iso_str = raw_str.split('.')[0]
+                    # Try full ISO with timezone
+                    if 'T' in iso_str:
+                        if iso_str.endswith('Z'):
+                            dt_tz = datetime.fromisoformat(iso_str.replace('Z', '+00:00'))
+                        else:
+                            dt_tz = datetime.fromisoformat(iso_str)
+                        # Convert to ET (naive) for comparison
+                        if dt_tz.tzinfo is not None:
+                            from zoneinfo import ZoneInfo
+                            et = ZoneInfo("America/New_York")
+                            dt = dt_tz.astimezone(et).replace(tzinfo=None)
+                        else:
+                            dt = dt_tz
+                    else:
+                        # Naive timestamp — assume already ET
+                        dt = datetime.strptime(iso_str, "%Y-%m-%d %H:%M:%S")
+                except (ValueError, AttributeError):
+                    # Fall back to naive parsing (strip timezone)
+                    dt = datetime.strptime(_parse_ts(raw_str).split('.')[0], "%Y-%m-%d %H:%M:%S")
             except ValueError:
                 continue
             if win_start <= dt <= upper:
