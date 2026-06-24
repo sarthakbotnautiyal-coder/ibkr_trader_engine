@@ -1294,6 +1294,22 @@ class AutoTraderEngine:
             )
             return
 
+        # Validate position still exists in IBKR before sending exit order
+        if not self.dry_run and self.client:
+            ibkr_positions = self.client.get_open_positions_ibkr()
+            position_exists_in_ibkr = any(
+                p.contract.strike == pos.short_strike
+                and p.position != 0
+                for p in ibkr_positions
+                if hasattr(p, 'contract') and hasattr(p, 'position')
+            )
+            if not position_exists_in_ibkr:
+                self.logger.warning(
+                    f"{ts} ET [EXIT SKIP] pos_id={pos.db_id} | "
+                    f"position not found in IBKR portfolio — may be already closed"
+                )
+                return
+
         if decision.should_exit:
             pnl = 0.0
 
