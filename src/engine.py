@@ -1379,6 +1379,21 @@ class AutoTraderEngine:
                     pos.db_id, ts, decision, em, gex_val, spx, decision.exit_layer,
                 )
                 self._pending_exit_times[result.order_id] = time.time()
+                self._record_signal(
+                    ts=ts, layer=decision.exit_layer,
+                    signalled=1,
+                    signal_reason=decision.reason,
+                    premium_passed=0,
+                    distance_passed=0,
+                    collision_passed=0,
+                    spx_spot=spx, em=em, gex_val=gex_val,
+                    action="exit",
+                    short_strike=pos.short_strike,
+                    long_strike=pos.long_strike,
+                    credit=pos.credit,
+                    vix=combined.vix,
+                    rsi=combined.rsi,
+                )
                 self.logger.info(
                     f"{ts} ET [EXIT_PENDING] pos_id={pos.db_id} | "
                     f"order_id={result.order_id} | reason={decision.reason} | "
