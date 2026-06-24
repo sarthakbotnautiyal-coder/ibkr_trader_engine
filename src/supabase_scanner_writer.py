@@ -49,6 +49,36 @@ PENDING_WRITES_PATH = Path.home() / "supabase_pending_writes_scanner.jsonl"
 _init_lock = threading.Lock()
 _writer_instance: "SupabaseScannerWriter | None" = None
 
+
+def _normalize_timestamp(value: str | None) -> str | None:
+    """Normalize a local timestamp to ISO 8601 with ET offset.
+
+    Naive ``"YYYY-MM-DD HH:MM:SS"`` values in this system are Eastern wall-clock
+    time. We attach America/New_York so the cloud ``TIMESTAMPTZ`` carries the
+    correct EST/EDT offset (DST-aware).
+
+    Examples:
+        "2026-06-24 10:10:20" → "2026-06-24T10:10:20-04:00"  (EDT)
+        "2026-01-15 10:10:20" → "2026-01-15T10:10:20-05:00"  (EST)
+        Already ISO with offset → passed through unchanged
+        None → None
+    """
+    if value is None:
+        return None
+    s = value.strip() if isinstance(value, str) else str(value)
+    if not s:
+        return None
+    # Already ISO 8601 with timezone (contains 'T' and offset)
+    if "T" in s and ("Z" in s or "+" in s[10:] or s.count("-") > 2):
+        return s
+    # Naive "YYYY-MM-DD HH:MM:SS" — assume ET wall-clock; attach America/New_York
+    try:
+        dt = datetime.strptime(s[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=_ET)
+        return dt.isoformat()
+    except (ValueError, IndexError):
+        # Best effort: hand it to the cloud and let PostgREST complain
+        return s
+
 # Columns written to the cloud — matches trading.scan_results schema exactly.
 _CLOUD_COLUMNS = [
     "raw_id_local",
@@ -84,14 +114,14 @@ _CLOUD_COLUMNS = [
 def _to_cloud_row(local_id: int, row: dict[str, Any]) -> dict[str, Any]:
     """Map a local scan_results row to a cloud-ready dict.
 
-    ``id`` (local) → ``raw_id_local`` (cloud). All other columns pass through
-    unchanged. ``received_at`` is stamped now (Eastern time) to record when the
-    row arrived in our system.
+    ``id`` (local) → ``raw_id_local`` (cloud). ``timestamp_est`` is normalized
+    to ISO 8601 with ET timezone offset. ``received_at`` is stamped now (Eastern
+    time) to record when the row arrived in our system.
     """
     return {
         "raw_id_local":       int(local_id),
         "source":             "scanner",
-        "timestamp_est":      row.get("timestamp_est"),
+        "timestamp_est":      _normalize_timestamp(row.get("timestamp_est")),
         "received_at":        datetime.now(_ET).isoformat(),
         "spx_spot":           row.get("spx_spot"),
         "expected_move":      row.get("expected_move"),
