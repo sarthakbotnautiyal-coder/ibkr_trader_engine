@@ -1273,6 +1273,27 @@ class AutoTraderEngine:
 
         self._log_exit_check(ts, pos, decision, spx)
 
+        # Verify position is actually open before attempting exit
+        if pos.status != "open":
+            self.logger.debug(
+                f"{ts} ET [EXIT SKIP] pos_id={pos.db_id} | "
+                f"position status is '{pos.status}', not 'open' — skipping"
+            )
+            return
+
+        # Check if this position already has a pending exit request
+        # to avoid sending multiple exit requests for the same position
+        position_has_pending_exit = any(
+            pos_db_id == pos.db_id
+            for pos_db_id, *_ in self._pending_exits.values()
+        )
+        if position_has_pending_exit:
+            self.logger.debug(
+                f"{ts} ET [EXIT SKIP] pos_id={pos.db_id} | "
+                f"already has pending exit request — skipping"
+            )
+            return
+
         if decision.should_exit:
             pnl = 0.0
 
