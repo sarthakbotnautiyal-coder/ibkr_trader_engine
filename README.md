@@ -9,7 +9,7 @@ A Python-based auto-trading engine for SPX 0DTE (zero days to expiration) option
 cd /Users/ubexbot/.openclaw/workspace-venkat
 git clone <repo> ibkr_trader_engine && cd ibkr_trader_engine
 python3 -m venv venv && source venv/bin/activate
-pip install -r requirements.txt
+pip install --only-binary=:all: -r requirements.txt   # IMPORTANT: see Install Dependencies section
 
 # 2. Configure credentials
 cp .env.example .env       # then edit .env with TELEGRAM_BOT_TOKEN, TELEGRAM_SIGNALS_CHAT_ID
@@ -85,10 +85,22 @@ source venv/bin/activate
 ### Step 3: Install Dependencies
 
 ```bash
-pip install -r requirements.txt
+pip install --only-binary=:all: -r requirements.txt
 ```
 
-> **Note:** `requirements.txt` pins all required packages including `supabase==2.31.0` and `python-dotenv==1.0.1` for cloud mode and `.env` loading.
+> **IMPORTANT — Always use `--only-binary=:all:`.**
+>
+> Without it, `pip` tries to build PyYAML 6.0 and pydantic 2.5.0 from source on Python 3.14+, which fails (Cython `cython_sources` compat issue + no pydantic-core 2.14.1 wheel for 3.14). The build error is non-obvious and leaves the venv in a half-installed state — engine then fails at startup with `ModuleNotFoundError: No module named 'yaml'` (or similar). The `--only-binary=:all:` flag forces pip to use prebuilt wheels (PyYAML 6.0.3, pydantic 2.13.x) and sidesteps the build issue entirely.
+>
+> **Note:** `requirements.txt` pins all required packages including `supabase==2.31.0`. PyYAML, pydantic, and python-dotenv use minimum-version pins (`>=...`) because their exact pins lack Python 3.14 wheels for transitive deps. The codebase works fine with the newer versions — verified by `run.py --test`.
+
+**Verify the install before starting the engine:**
+
+```bash
+./venv/bin/python run.py --test
+```
+
+This runs a quick smoke test (imports + DB init + read latest scan/GEX) and exits. If any required dep is missing you'll see `ModuleNotFoundError` here instead of after launching the engine and waiting for the first tick.
 
 ### Step 4: Verify Data Sources
 
@@ -279,12 +291,16 @@ For a production setup, use the watchdog pattern (already used for the extractor
 ```bash
 # Create a watchdog script: /Users/ubexbot/.openclaw/scripts/ibkr-engine-watchdog.sh
 #!/bin/bash
+# Watchdog for ibkr_trader_engine. Cron entry: */5 * * * * /path/to/this/script.sh
+# IMPORTANT: use ./venv/bin/python3 — the system /opt/homebrew/bin/python3 does
+# NOT have the engine's deps (PyYAML, ib-async, etc.) and will fail at startup
+# with ModuleNotFoundError. See "Install Dependencies" section above.
 PIDFILE=/Users/ubexbot/.openclaw/workspace-venkat/ibkr_trader_engine/run.pid
 if [ -f "$PIDFILE" ] && kill -0 $(cat "$PIDFILE") 2>/dev/null; then
   exit 0
 fi
 cd /Users/ubexbot/.openclaw/workspace-venkat/ibkr_trader_engine
-nohup bash -c 'set -a && source ./.env && set +a && exec /opt/homebrew/bin/python3 run.py' \
+nohup bash -c 'set -a && source ./.env && set +a && exec ./venv/bin/python3 run.py' \
   >> logs/engine_$(date +%Y-%m-%d).log 2>&1 < /dev/null &
 echo $! > "$PIDFILE"
 ```
@@ -501,6 +517,25 @@ Identical to LOCAL, except `combined_reader` returns `CloudSource` which reads f
 - ✅ Add 127.0.0.1 to Trusted IPs
 - ✅ UNCHECK "Read-Only API" (engine needs to place orders)
 
+### ModuleNotFoundError at Startup
+
+**Error: `ModuleNotFoundError: No module named 'yaml'` (or 'dateutil', 'ib_async', 'requests')**
+- ✅ The venv is missing required dependencies. Reinstall with the wheels-only flag:
+  ```bash
+  ./venv/bin/pip install --only-binary=:all: -r requirements.txt
+  ```
+- ✅ Verify after install: `./venv/bin/python run.py --test`
+- ✅ See "Step 3: Install Dependencies" above for why `--only-binary=:all:` is mandatory on Python 3.14+.
+
+**Error: `ModuleNotFoundError: No module named 'src'` or `config`**
+- ✅ You're running `python run.py` from outside the project dir. Always `cd ibkr_trader_engine` first, or invoke `./venv/bin/python run.py` from inside.
+
+**Error: Engine crashes silently, log shows nothing**
+- ✅ The engine buffers stdout when not connected to a TTY. Always redirect to a log file or run in foreground during debugging:
+  ```bash
+  ./venv/bin/python run.py 2>&1 | tee logs/debug.log
+  ```
+
 ### Data Source Missing (LOCAL mode)
 
 **Error: `FileNotFoundError: ../gex_extractor/data/gex.db`**
@@ -641,6 +676,7 @@ A: Edit `config/config.yaml` `entry.vix_buckets` and add a new entry. Restart th
 
 ## 📝 Version History
 
+- **v1.2** (2026-06-24): PyYAML/pydantic/pydantic-core pins relaxed to support Python 3.14 wheels; install command requires `--only-binary=:all:`; watchdog script updated to use venv python; added ModuleNotFoundError troubleshooting section.
 - **v1.1** (2026-06-23): CLOUD mode (Supabase), backtest improvements, watchdog support, updated README
 - **v1.0** (2026-06-20): Initial release with EST timezone awareness, multi-source data readers, Telegram integration
 

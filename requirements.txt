@@ -1,7 +1,21 @@
+# ibkr_trader_engine requirements
+#
+# IMPORTANT — install with: pip install --only-binary=:all: -r requirements.txt
+#
+# Use the `--only-binary=:all:` flag to force pip to use prebuilt wheels.
+# Without it, PyYAML 6.0 fails to build on Python 3.14 (Cython compat issue:
+# 'build_ext' object has no attribute 'cython_sources') and pydantic 2.5.0's
+# pinned pydantic-core 2.14.1 has no wheel for Python 3.14. The flag pulls
+# PyYAML 6.0.3 and the latest pydantic-core wheel instead.
+#
+# Pydantic and python-dotenv use >= because older exact pins (2.5.0, 1.0.1)
+# lack Python 3.14 wheels for their transitive deps. The codebase works
+# fine with the newer versions — verified by `run.py --test`.
+
 ib-async==2.1.0
 python-dateutil==2.9.0.post0
 requests==2.32.3
-PyYAML==6.0
-pydantic==2.5.0
-python-dotenv==1.0.1
+PyYAML>=6.0.1
+pydantic>=2.5.0
+python-dotenv>=1.0.1
 supabase==2.31.0
