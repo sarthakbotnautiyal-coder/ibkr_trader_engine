@@ -39,6 +39,28 @@ _LOGS_DIR = Path(__file__).parent.parent / CONFIG["paths"]["logs"]
 
 T = TypeVar("T")
 
+# Client-id fallback ladder. When the configured engine client id is already in
+# use by a stale session (IB Error 326), the background connect loop cycles
+# through base+offset for these offsets so a dead connection can't lock the
+# engine out indefinitely. The leading 0 is the configured id itself; alternates
+# are spaced by 100 to avoid colliding with sibling components (scanner/spot ids).
+_CLIENT_ID_FALLBACK_OFFSETS = (0, 100, 200, 300, 400, 500, 600, 700, 800, 900)
+
+
+def _compute_client_id(base: int, consecutive_failures: int) -> int:
+    """Pick the client id to try given how many consecutive connects have failed.
+
+    The first two attempts use the configured base id. After that the base is
+    almost certainly held by a stale session (IB Error 326), so cycle through
+    base+offset alternates. Offsets are always computed from the fixed base, so
+    the id range stays bounded and resets to the base after a clean connect.
+    """
+    if consecutive_failures < 2:
+        return base
+    n = len(_CLIENT_ID_FALLBACK_OFFSETS) - 1  # exclude the leading 0 offset
+    idx = ((consecutive_failures - 2) % n) + 1
+    return base + _CLIENT_ID_FALLBACK_OFFSETS[idx]
+
 
 def _setup_logger(name: str = __name__) -> logging.Logger:
     return get_engine_logger(name, _LOGS_DIR)
@@ -181,12 +203,27 @@ def _ib_thread_worker(state: _IBThreadState) -> None:
         logged. Creates a new IB() each attempt to avoid stale event-loop state.
         """
         nonlocal _consecutive_failures
+        eff_id = _compute_client_id(client_id, _consecutive_failures)
         ib = IB()
+
+        # Capture connection-level IB errors (reqId < 0) so a failed connect
+        # reports the real cause instead of an empty TimeoutError. Error 326
+        # ("client id already in use") arrives here, not as the raised exception.
+        captured = {"code": None, "msg": ""}
+
+        def _capture_err(reqId, errorCode, errorString, contract=None):
+            if reqId is None or reqId < 0:
+                captured["code"] = errorCode
+                captured["msg"] = errorString
+
+        ib.errorEvent += _capture_err
         try:
-            ib.connect(host, port, clientId=client_id, timeout=15, readonly=False)
+            ib.connect(host, port, clientId=eff_id, timeout=15, readonly=False)
             # Give ib_async time to complete post-connect handshake
             ib.sleep(0.5)
+            ib.errorEvent -= _capture_err
             state._ib = ib
+            state.client_id = eff_id  # record the id that actually worked
             # Fresh IB instance → any prior combo tickers are dead. Clear so the
             # engine re-subscribes cleanly (its per-tick subscribe is idempotent).
             state._combo_tickers.clear()
@@ -194,11 +231,25 @@ def _ib_thread_worker(state: _IBThreadState) -> None:
             state._connected.set()
             _consecutive_failures = 0
             state.log.info(
-                f"IBKR connected {host}:{port} client_id={client_id}"
+                f"IBKR connected {host}:{port} client_id={eff_id}"
             )
             return True
         except Exception as e:
-            state.log.warning(f"Connect failed: {e}")
+            code = captured["code"]
+            if code:
+                detail = f" [IB error {code}: {captured['msg']}]"
+            elif isinstance(e, TimeoutError):
+                detail = (
+                    " (no IB error before timeout — TWS/Gateway may be loading, "
+                    "API not accepting connections, or the client id is in use)"
+                )
+            else:
+                detail = ""
+            state.log.warning(f"Connect failed (clientId={eff_id}): {e!r}{detail}")
+            try:
+                ib.errorEvent -= _capture_err
+            except Exception:
+                pass
             try:
                 ib.disconnect()
             except Exception:
