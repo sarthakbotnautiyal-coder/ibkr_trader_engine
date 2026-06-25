@@ -128,6 +128,7 @@ class OnExitChecked(Protocol):
         spx: float,
         em: float,
         gex_val: float,
+        current_debit: Optional[float] = None,
     ) -> None: ...
 
 
@@ -329,6 +330,7 @@ class TickProcessor:
                 spx=spx,
                 em=em,
                 gex_val=gex_val,
+                current_debit=current_debit,
             )
 
     # -----------------------------------------------------------------------

@@ -973,12 +973,47 @@ class AutoTraderEngine:
                 entry_em=em,
             )
 
-    def _log_exit_check(self, ts: str, pos, decision, spx: float):
+    def _log_exit_check(self, ts: str, pos, decision, spx: float,
+                        combined=None, current_debit: Optional[float] = None):
+        """Full diagnostic line: live premium + unrealized P&L + every indicator
+        the L2 vote tracks (entry → current), plus the decision/vote summary."""
+
+        def _f(x, fmt="{:.2f}"):
+            return fmt.format(x) if isinstance(x, (int, float)) else "n/a"
+
+        def _pair(entry, cur, fmt="{:.1f}"):
+            return f"{_f(entry, fmt)}->{_f(cur, fmt)}"
+
+        side = pos.side.value if hasattr(pos.side, "value") else pos.side
+
+        # Live premium (debit-to-close) + unrealized P&L
+        if isinstance(current_debit, (int, float)):
+            n = getattr(pos, "num_contracts", 1) or 1
+            upnl = ((pos.credit or 0.0) - current_debit) * 100 * n
+            prem = f"premium={current_debit:.2f} uPnL=${upnl:+.2f}"
+        else:
+            prem = "premium=n/a uPnL=n/a"  # no live mark (DRY_RUN / not yet quoted)
+
+        # Indicator trajectories (entry baseline -> current from combined)
+        c_adx   = getattr(combined, "adx", None)
+        c_rsi   = getattr(combined, "rsi", None)
+        c_vix1d = getattr(combined, "vix1d", None)
+        c_macd  = getattr(combined, "macd_hist", None)
+        e_spx   = getattr(pos, "entry_spx_spot", None)
+        spx_delta = (spx - e_spx) if isinstance(e_spx, (int, float)) else None
+
         self.logger.info(
-            f"{ts} ET [EXIT CHECK] pos_id={pos.db_id} | "
-            f"{pos.side.value if hasattr(pos.side, 'value') else pos.side} | "
-            f"short={pos.short_strike} | PnL=unknown | "
-            f"reason={decision.reason} | SPX={spx:.2f}"
+            f"{ts} ET [EXIT CHECK] pos_id={pos.db_id} | {side} "
+            f"{_f(pos.short_strike, '{:.0f}')}/{_f(pos.long_strike, '{:.0f}')} | "
+            f"SPX={spx:.2f} (entry {_f(e_spx)}, Δ{_f(spx_delta, '{:+.2f}')}) | "
+            f"{prem} | "
+            f"ADX {_pair(getattr(pos,'entry_adx',None), c_adx)} | "
+            f"RSI {_pair(getattr(pos,'entry_rsi',None), c_rsi)} | "
+            f"VIX1D {_pair(getattr(pos,'entry_vix1d',None), c_vix1d)} | "
+            f"MACDh {_pair(getattr(pos,'entry_macd_hist',None), c_macd, '{:+.2f}')} | "
+            f"disp={_f(decision.displacement)} vs entry_em={_f(pos.entry_em)} | "
+            f"near_major={decision.near_major} major={_f(decision.major_level, '{:.0f}')} | "
+            f"votes={decision.exit_conditions_met} | {decision.reason}"
         )
 
     def _log_exited(self, ts: str, pos, pnl: float, reason: str, spx: float, exit_layer: int = 1):
@@ -1310,6 +1345,7 @@ class AutoTraderEngine:
         spx: float,
         em: float,
         gex_val: float,
+        current_debit: Optional[float] = None,
     ) -> None:
         """
         Called by TickProcessor for every open position every tick.
@@ -1320,7 +1356,7 @@ class AutoTraderEngine:
         """
         from executor import execute_exit
 
-        self._log_exit_check(ts, pos, decision, spx)
+        self._log_exit_check(ts, pos, decision, spx, combined, current_debit)
 
         # Verify position is actually open before attempting exit
         if pos.status != "open":
