@@ -168,6 +168,12 @@ class _IBThreadState:
         # close. Touched only on the IB thread.
         self._combo_tickers: Dict[str, Any] = {}
 
+        # Spread width (|short_strike - long_strike|) per combo key. Used to
+        # sanity-bound the debit-to-close (a valid debit is in [0, width]), so a
+        # bogus IB quote can't produce an out-of-range premium. Touched only on
+        # the IB thread, in lockstep with _combo_tickers.
+        self._combo_widths: Dict[str, float] = {}
+
 
 # -----------------------------------------------------------------------------
 # IB thread worker
@@ -226,7 +232,11 @@ def _ib_thread_worker(state: _IBThreadState) -> None:
             state.client_id = eff_id  # record the id that actually worked
             # Fresh IB instance → any prior combo tickers are dead. Clear so the
             # engine re-subscribes cleanly (its per-tick subscribe is idempotent).
+            # This is also the restart/reconnect recovery path: open positions are
+            # reloaded from the DB by the engine, and the per-tick exit loop
+            # re-subscribes a fresh BAG line for each, restoring live premium.
             state._combo_tickers.clear()
+            state._combo_widths.clear()
             _wire_callbacks(ib)
             state._connected.set()
             _consecutive_failures = 0
@@ -787,6 +797,7 @@ def _subscribe_combo_impl(
     bag = _combo_bag(ib, expiry, short_strike, long_strike, right)
     ticker = ib.reqMktData(bag, "", False, False)  # streaming (one line)
     state._combo_tickers[key] = ticker
+    state._combo_widths[key] = abs(short_strike - long_strike)
     log.info(
         f"COMBO_MKTDATA_SUB | key={key} {right} {short_strike:.0f}/{long_strike:.0f} "
         f"exp={expiry} (1 BAG line)"
@@ -795,24 +806,77 @@ def _subscribe_combo_impl(
 
 
 def _read_combo_debit_impl(ib: IB, state: "_IBThreadState", key: str) -> Optional[float]:
-    """Return current debit-to-close (abs of the BAG mid) for a subscribed position."""
+    """Return current debit-to-close (abs of the BAG mark) for a subscribed position.
+
+    IBKR uses -1 (with size 0) as the "no quote available" sentinel, which is
+    common for illiquid deep-OTM 0DTE combos. The previous implementation only
+    rejected None/NaN, so it averaged those -1 sentinels into a fabricated debit
+    (e.g. a worthless spread mis-marked at $1.50). That both inverted unrealized
+    P&L and falsely tripped the L2 premium exit vote.
+
+    Hardened rules:
+      * A bid/ask side counts only when its *size* is > 0 (a real resting quote).
+        Combo prices are legitimately negative (credit to open), so we cannot
+        filter on sign — size is the discriminator for the -1 sentinel.
+      * Prefer the mid of a valid bid AND ask; else fall back to |last|, then
+        |close|, but only when those are present and plausible.
+      * Bound the result to [0, spread_width]. Anything outside that range is
+        bad data → return None (skip the premium vote) rather than emit a lie.
+    """
     import math
     ticker = state._combo_tickers.get(key)
     if ticker is None:
         return None
 
-    def _ok(x) -> bool:
-        return x is not None and not (isinstance(x, float) and math.isnan(x))
+    def _num(x) -> Optional[float]:
+        if x is None:
+            return None
+        if isinstance(x, float) and math.isnan(x):
+            return None
+        return float(x)
 
-    bid, ask = getattr(ticker, "bid", None), getattr(ticker, "ask", None)
-    if _ok(bid) and _ok(ask):
-        mid = (bid + ask) / 2.0
-    elif _ok(getattr(ticker, "close", None)):
-        mid = ticker.close
+    def _side(price_attr: str, size_attr: str) -> Optional[float]:
+        """Return the price only if backed by a real resting quote (size > 0).
+
+        Size is the discriminator: IBKR's "no quote" sentinel carries size 0/-1.
+        We deliberately do NOT reject a price of -1 here — for a $10–20 wide
+        credit spread a -1.0 combo mark is a legitimate $1.00 credit-to-close,
+        and the size gate already removes the genuine sentinels.
+        """
+        price = _num(getattr(ticker, price_attr, None))
+        size = _num(getattr(ticker, size_attr, None))
+        if price is None or size is None or size <= 0:
+            return None
+        return price
+
+    bid = _side("bid", "bidSize")
+    ask = _side("ask", "askSize")
+
+    mark: Optional[float] = None
+    if bid is not None and ask is not None:
+        mark = (bid + ask) / 2.0
     else:
+        # Fall back to last trade, then prior close, when no two-sided quote.
+        last = _num(getattr(ticker, "last", None))
+        close = _num(getattr(ticker, "close", None))
+        for cand in (last, close):
+            if cand is not None and cand != -1.0:
+                mark = cand
+                break
+
+    if mark is None:
         return None
-    # BAG bid/ask are negative (you receive credit to open); debit to close = |mid|.
-    return abs(mid)
+
+    # BAG bid/ask are negative (you receive credit to open); debit to close = |mark|.
+    debit = abs(mark)
+
+    # Sanity bound: a vertical spread's debit-to-close is in [0, width]. Reject
+    # anything outside (bad/sentinel data) so the premium vote is never fed a lie.
+    width = state._combo_widths.get(key)
+    if width is not None and width > 0 and debit > width + 1e-9:
+        return None
+
+    return debit
 
 
 def _unsubscribe_combo_impl(
@@ -820,6 +884,7 @@ def _unsubscribe_combo_impl(
 ) -> bool:
     """Cancel a position's streaming BAG line on close (IB thread)."""
     ticker = state._combo_tickers.pop(key, None)
+    state._combo_widths.pop(key, None)
     if ticker is not None:
         try:
             ib.cancelMktData(ticker.contract)
