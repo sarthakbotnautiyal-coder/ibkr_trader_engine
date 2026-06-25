@@ -16,7 +16,6 @@ from datetime import datetime
 from typing import Optional, TYPE_CHECKING
 import logging
 
-import sqlite3
 from pathlib import Path
 import sys
 
@@ -26,6 +25,7 @@ if TYPE_CHECKING:
 # Import config for data source paths
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from config import CONFIG
+from db_utils import connect_ro_with_retry
 
 # Read paths from config
 TV_DB_PATH = CONFIG.get("data_sources", {}).get("tradingview_db", "../tradingView_signal_generator/data/tradingview.db")
@@ -48,7 +48,7 @@ def get_tv_spot() -> tuple[Optional[float], Optional[float]]:
     upstream tradingView_signal_generator process has itself stalled.
     """
     try:
-        conn = sqlite3.connect(f"file:{TV_DB}?mode=ro", uri=True, timeout=2.0)
+        conn = connect_ro_with_retry(TV_DB, "tradingview.db")
         try:
             row = conn.execute(
                 """
@@ -138,43 +138,42 @@ def get_latest_fundamentals(gex_expected_move: float = 0.0) -> TradingViewSnapsh
     Args:
         gex_expected_move: EM value from scanner.db to carry through.
     """
-    conn = sqlite3.connect(str(TV_DB))
-    conn.execute("PRAGMA journal_mode = WAL;")
+    conn = connect_ro_with_retry(TV_DB, "tradingview.db")
+    try:
+        # The first 12 columns are always present; regime/vix/vix1d are optional
+        # (added via ALTER on older DBs). Detect each and append in a fixed order
+        # so we can read them by offset after the 12 base columns.
+        all_cols = {r[1] for r in conn.execute("PRAGMA table_info(spx_standardized)").fetchall()}
+        has_regime_col = "regime" in all_cols
+        has_vix_col    = "vix" in all_cols
+        has_vix1d_col  = "vix1d" in all_cols
 
-    # The first 12 columns are always present; regime/vix/vix1d are optional
-    # (added via ALTER on older DBs). Detect each and append in a fixed order so
-    # we can read them by offset after the 12 base columns.
-    all_cols = {r[1] for r in conn.execute("PRAGMA table_info(spx_standardized)").fetchall()}
-    has_regime_col = "regime" in all_cols
-    has_vix_col    = "vix" in all_cols
-    has_vix1d_col  = "vix1d" in all_cols
+        optional_cols = []
+        if has_regime_col:
+            optional_cols.append("regime")
+        if has_vix_col:
+            optional_cols.append("vix")
+        if has_vix1d_col:
+            optional_cols.append("vix1d")
+        optional_select = ("," + ",".join(optional_cols)) if optional_cols else ""
 
-    optional_cols = []
-    if has_regime_col:
-        optional_cols.append("regime")
-    if has_vix_col:
-        optional_cols.append("vix")
-    if has_vix1d_col:
-        optional_cols.append("vix1d")
-    optional_select = ("," + ",".join(optional_cols)) if optional_cols else ""
-
-    rows = conn.execute(f"""
-        SELECT
-            price, rsi,
-            macd, macd_signal, macd_hist,
-            adx,
-            bb_upper, bb_middle, bb_lower,
-            ema9, ema21, ema50{optional_select}
-        FROM spx_standardized
-        WHERE alert_type = 'fundamentals'
-          AND price      IS NOT NULL
-          AND bb_upper   IS NOT NULL
-          AND bb_lower   IS NOT NULL
-          AND bb_upper   != bb_lower
-        ORDER BY received_at ASC
-    """).fetchall()
-
-    conn.close()
+        rows = conn.execute(f"""
+            SELECT
+                price, rsi,
+                macd, macd_signal, macd_hist,
+                adx,
+                bb_upper, bb_middle, bb_lower,
+                ema9, ema21, ema50{optional_select}
+            FROM spx_standardized
+            WHERE alert_type = 'fundamentals'
+              AND price      IS NOT NULL
+              AND bb_upper   IS NOT NULL
+              AND bb_lower   IS NOT NULL
+              AND bb_upper   != bb_lower
+            ORDER BY received_at ASC
+        """).fetchall()
+    finally:
+        conn.close()
 
     # Map optional column name -> tuple index (base columns occupy 0..11)
     _opt_idx = {name: 12 + i for i, name in enumerate(optional_cols)}

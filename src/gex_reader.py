@@ -3,7 +3,6 @@ gex_reader.py — read GEX data from LOCAL or CLOUD sources.
 
 Uses data_sources abstraction layer to support both LOCAL (SQLite) and CLOUD (Supabase) modes.
 """
-import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -11,6 +10,7 @@ import logging
 
 from config import CONFIG
 from data_sources import get_gex_snapshots_table, get_tradingview_fundamentals_table, is_local_mode
+from db_utils import connect_ro_with_retry
 
 _LOG = logging.getLogger(__name__)
 
@@ -73,12 +73,13 @@ def get_latest_gex(db_path: Path = None) -> Optional[GexSnapshot]:
             # LOCAL mode: Read directly from SQLite
             if db_path is None:
                 db_path = GEX_DB
-            conn = sqlite3.connect(db_path)
-            conn.execute("PRAGMA journal_mode = WAL;")
-            row = conn.execute(
-                "SELECT * FROM gex_snapshots ORDER BY timestamp DESC LIMIT 1"
-            ).fetchone()
-            conn.close()
+            conn = connect_ro_with_retry(db_path, "gex.db")
+            try:
+                row = conn.execute(
+                    "SELECT * FROM gex_snapshots ORDER BY timestamp DESC LIMIT 1"
+                ).fetchone()
+            finally:
+                conn.close()
             if row is None:
                 return None
             return _row_to_gex(row)
@@ -118,19 +119,20 @@ def get_latest_regime() -> str:
     try:
         if is_local_mode():
             # LOCAL mode: Direct SQLite query
-            conn = sqlite3.connect(str(TV_DB))
-            conn.execute("PRAGMA journal_mode = WAL;")
-            row = conn.execute("""
-                SELECT regime
-                FROM spx_standardized
-                WHERE alert_category  = 'indicator_snapshot'
-                  AND alert_type      = 'fundamentals'
-                  AND regime          IS NOT NULL
-                  AND regime          != ''
-                ORDER BY id DESC
-                LIMIT 1
-            """).fetchone()
-            conn.close()
+            conn = connect_ro_with_retry(TV_DB, "tradingview.db")
+            try:
+                row = conn.execute("""
+                    SELECT regime
+                    FROM spx_standardized
+                    WHERE alert_category  = 'indicator_snapshot'
+                      AND alert_type      = 'fundamentals'
+                      AND regime          IS NOT NULL
+                      AND regime          != ''
+                    ORDER BY id DESC
+                    LIMIT 1
+                """).fetchone()
+            finally:
+                conn.close()
             if row and row[0]:
                 return row[0].strip()
         else:

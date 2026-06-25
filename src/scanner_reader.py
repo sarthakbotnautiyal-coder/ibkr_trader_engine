@@ -3,7 +3,6 @@ scanner_reader.py — read scan results from LOCAL or CLOUD sources.
 
 Uses data_sources abstraction layer to support both LOCAL (SQLite) and CLOUD (Supabase) modes.
 """
-import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -13,6 +12,7 @@ import logging
 
 from config import CONFIG
 from data_sources import get_scan_results_table, is_local_mode
+from db_utils import connect_ro_with_retry
 
 _LOG = logging.getLogger(__name__)
 
@@ -93,12 +93,13 @@ def get_latest_scan(db_path: Path = None) -> Optional[ScanRow]:
             # LOCAL mode: Read directly from SQLite
             if db_path is None:
                 db_path = SCANNER_DB
-            conn = sqlite3.connect(db_path)
-            conn.execute("PRAGMA journal_mode = WAL;")
-            row = conn.execute(
-                "SELECT * FROM scan_results ORDER BY timestamp_est DESC LIMIT 1"
-            ).fetchone()
-            conn.close()
+            conn = connect_ro_with_retry(db_path, "scanner.db")
+            try:
+                row = conn.execute(
+                    "SELECT * FROM scan_results ORDER BY timestamp_est DESC LIMIT 1"
+                ).fetchone()
+            finally:
+                conn.close()
             if row is None:
                 return None
             return _row_to_scan(row)
@@ -158,13 +159,14 @@ def get_scan_history(
 ) -> list[ScanRow]:
     """Return scan rows from the last N minutes."""
     cutoff = _cutoff_time(minutes)
-    conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA journal_mode = WAL;")
-    rows = conn.execute(
-        "SELECT * FROM scan_results WHERE timestamp_est >= ? ORDER BY timestamp_est ASC",
-        (cutoff,),
-    ).fetchall()
-    conn.close()
+    conn = connect_ro_with_retry(db_path, "scanner.db")
+    try:
+        rows = conn.execute(
+            "SELECT * FROM scan_results WHERE timestamp_est >= ? ORDER BY timestamp_est ASC",
+            (cutoff,),
+        ).fetchall()
+    finally:
+        conn.close()
     return [_row_to_scan(r) for r in rows]
 
 
