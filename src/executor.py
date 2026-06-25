@@ -171,6 +171,23 @@ class IBKRClient:
             return True
         return self._real._health_check()
 
+    # --- Live combo marks (L2 premium exit vote) — delegate to BlockingIBKRClient ---
+
+    def subscribe_combo_mark(self, key, expiry, short_strike, long_strike, right) -> bool:
+        if DRY_RUN or self._real is None:
+            return False
+        return self._real.subscribe_combo_mark(key, expiry, short_strike, long_strike, right)
+
+    def get_combo_debit(self, key):
+        if DRY_RUN or self._real is None:
+            return None
+        return self._real.get_combo_debit(key)
+
+    def unsubscribe_combo_mark(self, key) -> None:
+        if DRY_RUN or self._real is None:
+            return
+        self._real.unsubscribe_combo_mark(key)
+
     def place_order(self, params: OrderParams) -> FillResult:
         if DRY_RUN:
             self._order_id = getattr(self, "_order_id", 1000) + 1

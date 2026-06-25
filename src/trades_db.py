@@ -150,6 +150,9 @@ def init_db(path: Path = DB_PATH) -> None:
         ("fill_price",          "REAL"),
         ("fill_time",           "TEXT"),
         ("order_time",          "TEXT"),
+        # Real VIX1D capture for momentum-aware L2 exit
+        ("entry_vix1d",         "REAL"),
+        ("exit_vix1d",          "REAL"),
     ]
     SIGNAL_NEW_COLS = [
         ("spx_spot",             "REAL    NOT NULL"),
@@ -241,6 +244,7 @@ class Position:
     entry_atm_call_mid:  Optional[float] = None
     entry_atm_put_mid:   Optional[float] = None
     entry_atm_strike:    Optional[float] = None
+    entry_vix1d:         Optional[float] = None
 
     # Exit market snapshot
     exit_spx_spot:       Optional[float] = None
@@ -250,6 +254,7 @@ class Position:
     exit_rsi:            Optional[float] = None
     exit_adx:            Optional[float] = None
     exit_macd_hist:      Optional[float] = None
+    exit_vix1d:          Optional[float] = None
 
     # Exit decision metadata
     exit_layer:          Optional[int] = None
@@ -313,6 +318,7 @@ def _row_to_position(row: tuple) -> Position:
         entry_atm_call_mid=g("entry_atm_call_mid"),
         entry_atm_put_mid=g("entry_atm_put_mid"),
         entry_atm_strike=g("entry_atm_strike"),
+        entry_vix1d=g("entry_vix1d"),
 
         # Exit snapshot
         exit_spx_spot=g("exit_spx_spot"),
@@ -322,6 +328,7 @@ def _row_to_position(row: tuple) -> Position:
         exit_rsi=g("exit_rsi"),
         exit_adx=g("exit_adx"),
         exit_macd_hist=g("exit_macd_hist"),
+        exit_vix1d=g("exit_vix1d"),
 
         # Exit metadata
         exit_layer=g("exit_layer"),
@@ -362,7 +369,7 @@ def insert_position(conn: sqlite3.Connection, pos: Position) -> int:
              entry_spx_spot, entry_vix, entry_em, entry_gex,
              entry_bb_position, entry_bb_expanding, entry_adx,
              entry_macd_hist, entry_rsi, entry_atm_call_mid,
-             entry_atm_put_mid, entry_atm_strike,
+             entry_atm_put_mid, entry_atm_strike, entry_vix1d,
              exit_spx_spot, exit_vix, exit_em, exit_bb_position,
              exit_rsi, exit_adx, exit_macd_hist,
              exit_layer, exit_conditions_met,
@@ -370,10 +377,10 @@ def insert_position(conn: sqlite3.Connection, pos: Position) -> int:
              exit_regime, exit_gex_regime,
              order_id, order_action, fill_price, fill_time, order_time)
         VALUES
-            (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+            (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
              ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-             ?, ?, ?, ?, ?, ?, ?, ?,
-             ?, ?, ?, ?, ?, ?,
+             ?, ?, ?, ?, ?, ?, ?,
+             ?, ?, ?, ?, ?, ?, ?,
              ?, ?, ?, ?, ?)
         """,
         (
@@ -386,7 +393,7 @@ def insert_position(conn: sqlite3.Connection, pos: Position) -> int:
             pos.entry_spx_spot, pos.entry_vix, pos.entry_em, pos.entry_gex,
             pos.entry_bb_position, pos.entry_bb_expanding, pos.entry_adx,
             pos.entry_macd_hist, pos.entry_rsi, pos.entry_atm_call_mid,
-            pos.entry_atm_put_mid, pos.entry_atm_strike,
+            pos.entry_atm_put_mid, pos.entry_atm_strike, pos.entry_vix1d,
 
             pos.exit_spx_spot, pos.exit_vix, pos.exit_em,
             pos.exit_bb_position, pos.exit_rsi,
@@ -481,6 +488,7 @@ def update_position_exit_snapshot(
     exit_conditions_met: Optional[int],
     exit_regime: Optional[str] = None,
     exit_gex_regime: Optional[str] = None,
+    exit_vix1d: Optional[float] = None,
 ) -> None:
     conn.execute(
         """
@@ -489,14 +497,14 @@ def update_position_exit_snapshot(
             exit_bb_position = ?, exit_rsi = ?, exit_adx = ?,
             exit_macd_hist = ?, exit_layer = ?,
             exit_conditions_met = ?, exit_regime = ?,
-            exit_gex_regime = ?
+            exit_gex_regime = ?, exit_vix1d = ?
         WHERE id = ?
         """,
         (
             exit_spx_spot, exit_vix, exit_em,
             exit_bb_position, exit_rsi, exit_adx, exit_macd_hist,
             exit_layer, exit_conditions_met, exit_regime,
-            exit_gex_regime,
+            exit_gex_regime, exit_vix1d,
             pos_id,
         ),
     )

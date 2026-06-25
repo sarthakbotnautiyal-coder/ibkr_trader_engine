@@ -158,6 +158,7 @@ class CombinedSnapshot:
     regime:        str
 
     vix:           Optional[float] = None  # None → fall back to expected_move * 16
+    vix1d:         Optional[float] = None  # 1-day VIX (intraday-move expansion signal)
 
 
 # ---------------------------------------------------------------------------
@@ -205,7 +206,7 @@ def _window_clause(scan_ts: str) -> tuple[str, str, str]:
 TV_IDX = dict(
     price=5, rsi=7, macd=8, macd_signal=9, macd_hist=10,
     adx=11, bb_upper=13, bb_middle=14, bb_lower=15,
-    ema9=26, ema21=27, ema50=28, regime=30, vix=31,
+    ema9=26, ema21=27, ema50=28, regime=30, vix=31, vix1d=32,
 )
 
 
@@ -283,6 +284,7 @@ def _tv_tuple_to_dict(row: tuple) -> dict:
         bb_lower=float(row[TV_IDX["bb_lower"]]),
         regime=row[TV_IDX["regime"]],
         vix=row[TV_IDX["vix"]],
+        vix1d=row[TV_IDX["vix1d"]] if len(row) > TV_IDX["vix1d"] else None,
     )
 
 
@@ -298,6 +300,7 @@ def _tv_cloud_to_dict(row: dict) -> dict:
         bb_lower=float(row.get("bb_lower")),
         regime=row.get("regime"),
         vix=row.get("vix"),
+        vix1d=row.get("vix1d"),
     )
 
 
@@ -332,11 +335,14 @@ def _build_tv_fields(tv: dict, prior: Optional[dict]) -> dict:
     vix_raw = tv["vix"]
     vix = float(vix_raw) if vix_raw is not None else None
 
+    vix1d_raw = tv.get("vix1d")
+    vix1d = float(vix1d_raw) if vix1d_raw is not None else None
+
     return dict(
         rsi=rsi, bb_upper=bb_upper, bb_middle=bb_middle, bb_lower=bb_lower,
         bb_position=bb_position, bb_expanding=bb_exp, adx=adx,
         macd_hist=macd_hist, macd_expanding=macd_exp, adx_rising=adx_rise,
-        regime=regime, vix=vix,
+        regime=regime, vix=vix, vix1d=vix1d,
     )
 
 

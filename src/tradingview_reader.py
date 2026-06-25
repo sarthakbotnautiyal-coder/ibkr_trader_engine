@@ -117,6 +117,10 @@ class TradingViewSnapshot:
     # Regime (pre-computed by tradingView_signal_generator, or fallback)
     regime: str = "unknown"  # regime name or "unknown"
 
+    # Volatility (real values from tradingview.db; 0.0 when column absent/NULL)
+    vix: float = 0.0
+    vix1d: float = 0.0
+
     # Market context (passed in from scanner)
     expected_move: float = 0.0
 
@@ -137,45 +141,43 @@ def get_latest_fundamentals(gex_expected_move: float = 0.0) -> TradingViewSnapsh
     conn = sqlite3.connect(str(TV_DB))
     conn.execute("PRAGMA journal_mode = WAL;")
 
-    # Check if regime column exists
+    # The first 12 columns are always present; regime/vix/vix1d are optional
+    # (added via ALTER on older DBs). Detect each and append in a fixed order so
+    # we can read them by offset after the 12 base columns.
     all_cols = {r[1] for r in conn.execute("PRAGMA table_info(spx_standardized)").fetchall()}
     has_regime_col = "regime" in all_cols
+    has_vix_col    = "vix" in all_cols
+    has_vix1d_col  = "vix1d" in all_cols
 
+    optional_cols = []
     if has_regime_col:
-        rows = conn.execute("""
-            SELECT
-                price, rsi,
-                macd, macd_signal, macd_hist,
-                adx,
-                bb_upper, bb_middle, bb_lower,
-                ema9, ema21, ema50,
-                regime
-            FROM spx_standardized
-            WHERE alert_type = 'fundamentals'
-              AND price      IS NOT NULL
-              AND bb_upper   IS NOT NULL
-              AND bb_lower   IS NOT NULL
-              AND bb_upper   != bb_lower
-            ORDER BY received_at ASC
-        """).fetchall()
-    else:
-        rows = conn.execute("""
-            SELECT
-                price, rsi,
-                macd, macd_signal, macd_hist,
-                adx,
-                bb_upper, bb_middle, bb_lower,
-                ema9, ema21, ema50
-            FROM spx_standardized
-            WHERE alert_type = 'fundamentals'
-              AND price      IS NOT NULL
-              AND bb_upper   IS NOT NULL
-              AND bb_lower   IS NOT NULL
-              AND bb_upper   != bb_lower
-            ORDER BY received_at ASC
-        """).fetchall()
+        optional_cols.append("regime")
+    if has_vix_col:
+        optional_cols.append("vix")
+    if has_vix1d_col:
+        optional_cols.append("vix1d")
+    optional_select = ("," + ",".join(optional_cols)) if optional_cols else ""
+
+    rows = conn.execute(f"""
+        SELECT
+            price, rsi,
+            macd, macd_signal, macd_hist,
+            adx,
+            bb_upper, bb_middle, bb_lower,
+            ema9, ema21, ema50{optional_select}
+        FROM spx_standardized
+        WHERE alert_type = 'fundamentals'
+          AND price      IS NOT NULL
+          AND bb_upper   IS NOT NULL
+          AND bb_lower   IS NOT NULL
+          AND bb_upper   != bb_lower
+        ORDER BY received_at ASC
+    """).fetchall()
 
     conn.close()
+
+    # Map optional column name -> tuple index (base columns occupy 0..11)
+    _opt_idx = {name: 12 + i for i, name in enumerate(optional_cols)}
 
     if not rows:
         raise RuntimeError(
@@ -200,8 +202,16 @@ def get_latest_fundamentals(gex_expected_move: float = 0.0) -> TradingViewSnapsh
 
     # Regime: read from DB or compute via fallback
     precomputed_regime: Optional[str] = None
-    if has_regime_col and len(latest) > 12:
-        precomputed_regime = latest[12]
+    if has_regime_col and len(latest) > _opt_idx["regime"]:
+        precomputed_regime = latest[_opt_idx["regime"]]
+
+    # Volatility: real VIX / VIX1D when present (else 0.0)
+    vix_val = 0.0
+    if has_vix_col and len(latest) > _opt_idx["vix"] and latest[_opt_idx["vix"]] is not None:
+        vix_val = float(latest[_opt_idx["vix"]])
+    vix1d_val = 0.0
+    if has_vix1d_col and len(latest) > _opt_idx["vix1d"] and latest[_opt_idx["vix1d"]] is not None:
+        vix1d_val = float(latest[_opt_idx["vix1d"]])
 
     if precomputed_regime and precomputed_regime.strip():
         regime = precomputed_regime.strip()
@@ -250,6 +260,8 @@ def get_latest_fundamentals(gex_expected_move: float = 0.0) -> TradingViewSnapsh
         adx_rising=adx_rise,
         macd_expanding=macd_exp,
         regime=regime,
+        vix=vix_val,
+        vix1d=vix1d_val,
         expected_move=gex_expected_move,
     )
 

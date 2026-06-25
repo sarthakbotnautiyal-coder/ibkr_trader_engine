@@ -128,6 +128,7 @@ class OnExitChecked(Protocol):
         spx: float,
         em: float,
         gex_val: float,
+        current_debit: Optional[float] = None,
     ) -> None: ...
 
 
@@ -180,12 +181,16 @@ class TickProcessor:
         on_exit_checked: OnExitChecked,
         on_heartbeat: Optional[OnHeartbeat] = None,
         is_live: bool = True,
+        debit_provider: Optional[Callable] = None,
     ):
         self._on_enter_approved = on_enter_approved
         self._on_skip = on_skip
         self._on_exit_checked = on_exit_checked
         self._on_heartbeat = on_heartbeat
         self._is_live = is_live
+        # Optional callable(pos) -> Optional[float] returning the live debit-to-close
+        # for the L2 premium exit vote. None (default) → premium vote is skipped.
+        self._debit_provider = debit_provider
 
         # Per-side anti-spam skip state: only log SKIP on reason CHANGE
         self._last_skip_reason: dict[str, Optional[str]] = {"CALL": None, "PUT": None}
@@ -309,7 +314,13 @@ class TickProcessor:
         from risk_manager import evaluate_exit
 
         for pos in store.get_open():
-            decision = evaluate_exit(pos, combined)
+            current_debit = None
+            if self._debit_provider is not None:
+                try:
+                    current_debit = self._debit_provider(pos)
+                except Exception:
+                    current_debit = None
+            decision = evaluate_exit(pos, combined, current_debit=current_debit)
             self._on_exit_checked(
                 ts=ts,
                 pos=pos,
@@ -319,6 +330,7 @@ class TickProcessor:
                 spx=spx,
                 em=em,
                 gex_val=gex_val,
+                current_debit=current_debit,
             )
 
     # -----------------------------------------------------------------------

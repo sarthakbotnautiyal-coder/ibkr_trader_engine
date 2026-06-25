@@ -460,35 +460,61 @@ class ExitDecision:
     major_level:          Optional[float] = None
 
 
+def _num(x) -> Optional[float]:
+    """Return x as a float if it is a real finite number, else None. Indicator
+    votes that depend on a missing/malformed value are simply skipped."""
+    if isinstance(x, bool):
+        return None
+    if isinstance(x, (int, float)):
+        xf = float(x)
+        return None if xf != xf else xf  # drop NaN
+    return None
+
+
+def _exit_cfg() -> dict:
+    """L2 exit thresholds from config, with safe defaults if the section is absent."""
+    cfg = CONFIG.get("exit", {}) or {}
+    return dict(
+        votes_to_exit = int(cfg.get("votes_to_exit", 2)),
+        adx_floor     = float(cfg.get("adx_floor", 20.0)),
+        adx_rise      = float(cfg.get("adx_rise", 8.0)),
+        vix1d_mult    = float(cfg.get("vix1d_mult", 1.20)),
+        rsi_put       = float(cfg.get("rsi_put", 35.0)),
+        rsi_call      = float(cfg.get("rsi_call", 65.0)),
+        premium_mult  = float(cfg.get("premium_mult", 3.0)),
+    )
+
+
 def evaluate_exit(
     position,
     combined,
+    current_debit: Optional[float] = None,
 ) -> ExitDecision:
     """
-    Two-level exit logic (TASK-2026-187, simplified TASK-2026-199):
+    Momentum-aware exit logic (TASK-2026-187 → TASK-2026-199 → momentum upgrade).
 
-    L1: SPX crosses short strike -> EXIT (hard stop, unchanged).
+    L1 (unchanged): SPX crosses the short strike -> EXIT (hard stop).
 
-    L2: BOTH conditions must be true to EXIT:
-        1. |SPX - short_strike| < position.entry_em   (SPX is near the short strike)
-        2. near major (|short_strike - major_level| < current_em)
-           (short strike is near a major GEX volume level)
-        Otherwise -> STAY
+    L2 (adverse-condition vote): instead of waiting for price to reach the strike,
+    count how many independent "market is turning against this position" conditions
+    are true, and exit once >= votes_to_exit (default 2) fire. This lets L2 trigger
+    while price is still well away from the strike, capping losses on trending days.
 
-    ADX and GEX checks removed in TASK-2026-199 (L2 simplified to 2 conditions).
+    The conditions (each contributes one vote):
+      1. trend     — ADX >= adx_floor and (ADX - entry_adx) >= adx_rise, price adverse
+      2. vol       — VIX1D >= entry_vix1d * vix1d_mult (intraday move expanding), price adverse
+      3. momentum  — PUT: RSI <= rsi_put & falling; CALL: RSI >= rsi_call & rising
+      4. proximity — |SPX - short_strike| < entry_em (price near the strike)
+      5. near_major— short strike within CURRENT EM of the side's major GEX level
+      6. premium   — debit-to-close >= credit * premium_mult (live mark; skipped if None)
 
-    near major uses CURRENT expected_move (combined.expected_move), NOT entry_em.
+    Backward-compat: the OLD L2 (proximity AND near_major) maps exactly onto two
+    votes (4 + 5), so positions opened before this upgrade — which lack indicator
+    baselines — retain identical protection. Indicator votes simply don't fire when
+    their entry baseline is missing.
 
-    Decision table (L2 -- L1 always fires first when SPX crosses strike):
-
-    | Displacement vs entry_em | Near major | Action |
-    |--------------------------|-------------|--------|
-    | >= entry_em (away)       | --          | STAY   |
-    | < entry_em (near)        | False       | STAY   |
-    | < entry_em (near)        | True        | **EXIT** |
-
-    entry_em is captured and stored at position open time (via add_position
-    in position_store.py). No force-close -- positions run naturally.
+    Baselines (entry_adx/entry_rsi/entry_vix1d/entry_spx_spot/entry_em) are captured
+    at open time (position_store.add_position, sourced from the decision snapshot).
     """
     spx = combined.spx_spot
     em  = combined.expected_move
@@ -523,7 +549,7 @@ def evaluate_exit(
                 major_level=None,
             )
 
-    # --- L2: proximity + near-major exit (TASK-2026-199: simplified to 2 conditions) ---
+    # --- L2: adverse-condition vote ---
 
     if position.entry_em is None or position.entry_em <= 0:
         return ExitDecision(
@@ -537,64 +563,87 @@ def evaluate_exit(
             major_level=None,
         )
 
+    cfg = _exit_cfg()
+    is_call = side == "CALL"
     displacement = abs(spx - position.short_strike)
 
-    # Assign major_level BEFORE first use (Condition 1 proximity check)
-    if side == "CALL":
-        major_level = getattr(combined, "major_positive_by_volume", None)
+    # Side's major GEX volume level
+    if is_call:
+        major_level = _num(getattr(combined, "major_positive_by_volume", None))
     else:
-        major_level = getattr(combined, "major_negative_by_volume", None)
+        major_level = _num(getattr(combined, "major_negative_by_volume", None))
 
-    # Condition 1: proximity check
-    if displacement >= position.entry_em:
-        return ExitDecision(
-            should_exit=False,
-            reason=(
-                f"L2 | STAY | SPX={spx:.2f} short={position.short_strike:.0f} "
-                f"disp={displacement:.2f} >= entry_em={position.entry_em:.2f}"
-            ),
-            exit_layer=2,
-            exit_conditions_met=0,
-            exit_regime=exit_regime,
-            displacement=displacement,
-            near_major=False,
-            major_level=major_level if major_level is not None else None,
-        )
+    # Is price moving against the short side vs entry? (gate for trend/vol/momentum)
+    entry_spx = _num(getattr(position, "entry_spx_spot", None))
+    if entry_spx is not None:
+        adverse_dir = (spx > entry_spx) if is_call else (spx < entry_spx)
+    else:
+        adverse_dir = True  # no baseline → don't gate (proximity already implies adverse)
 
-    # Condition 2: near-major check
-    # (moved above Condition 1 — major_level now assigned before first use)
+    # Current indicators
+    adx   = _num(getattr(combined, "adx", None))
+    rsi   = _num(getattr(combined, "rsi", None))
+    vix1d = _num(getattr(combined, "vix1d", None))
 
+    # Entry baselines (may be None for legacy positions)
+    entry_adx   = _num(getattr(position, "entry_adx", None))
+    entry_rsi   = _num(getattr(position, "entry_rsi", None))
+    entry_vix1d = _num(getattr(position, "entry_vix1d", None))
+
+    votes: list[str] = []
+
+    # 1. trend — ADX trending up through a real-trend floor, price adverse
+    if adverse_dir and adx is not None and entry_adx is not None:
+        if adx >= cfg["adx_floor"] and (adx - entry_adx) >= cfg["adx_rise"]:
+            votes.append(f"trend(adx {entry_adx:.0f}->{adx:.0f})")
+
+    # 2. vol — VIX1D expanding vs entry, price adverse
+    if adverse_dir and vix1d and entry_vix1d and entry_vix1d > 0:
+        if vix1d >= entry_vix1d * cfg["vix1d_mult"]:
+            votes.append(f"vol(vix1d {entry_vix1d:.1f}->{vix1d:.1f})")
+
+    # 3. momentum — RSI pressing against the short side and worse than entry
+    if rsi is not None:
+        if is_call:
+            if rsi >= cfg["rsi_call"] and (entry_rsi is None or rsi > entry_rsi):
+                votes.append(f"momentum(rsi {rsi:.0f}>= {cfg['rsi_call']:.0f})")
+        else:
+            if rsi <= cfg["rsi_put"] and (entry_rsi is None or rsi < entry_rsi):
+                votes.append(f"momentum(rsi {rsi:.0f}<= {cfg['rsi_put']:.0f})")
+
+    # 4. proximity — price near the short strike (legacy L2 condition 1)
+    proximity = displacement < position.entry_em
+    if proximity:
+        votes.append(f"proximity(disp {displacement:.1f}<em {position.entry_em:.1f})")
+
+    # 5. near_major — short strike near the side's major GEX level (legacy condition 2)
     near_major = False
     if major_level is not None and major_level != 0.0:
-        displacement_from_major = abs(position.short_strike - major_level)
-        near_major = displacement_from_major < em  # uses CURRENT expected_move
-
+        near_major = abs(position.short_strike - major_level) < em  # CURRENT em
     if near_major:
-        return ExitDecision(
-            should_exit=True,
-            reason=(
-                f"L2 | EXIT | disp={displacement:.2f} < entry_em={position.entry_em:.2f} "
-                f"near_major=True | SPX={spx:.2f} short={position.short_strike:.0f}"
-            ),
-            exit_layer=2,
-            exit_conditions_met=2,
-            exit_regime=exit_regime,
-            displacement=displacement,
-            near_major=True,
-            major_level=major_level if major_level is not None else None,
-        )
+        votes.append("near_major")
+
+    # 6. premium — live debit-to-close past the stop multiple (skipped if no mark)
+    if current_debit is not None and position.credit and position.credit > 0:
+        if current_debit >= position.credit * cfg["premium_mult"]:
+            votes.append(f"premium(debit {current_debit:.2f}>= {cfg['premium_mult']:.1f}x credit)")
+
+    n = len(votes)
+    should_exit = n >= cfg["votes_to_exit"]
+    verb = "EXIT" if should_exit else "STAY"
+    reason = (
+        f"L2 | {verb} | votes={n}/{cfg['votes_to_exit']} [{', '.join(votes) or 'none'}] | "
+        f"SPX={spx:.2f} short={position.short_strike:.0f} disp={displacement:.1f}"
+    )
 
     return ExitDecision(
-        should_exit=False,
-        reason=(
-            f"L2 | STAY | proximity OK disp={displacement:.2f} < entry_em={position.entry_em:.2f} "
-            f"but near_major=False | SPX={spx:.2f} short={position.short_strike:.0f}"
-        ),
+        should_exit=should_exit,
+        reason=reason,
         exit_layer=2,
-        exit_conditions_met=1,
+        exit_conditions_met=n,
         exit_regime=exit_regime,
         displacement=displacement,
-        near_major=False,
+        near_major=near_major,
         major_level=major_level if major_level is not None else None,
     )
 
