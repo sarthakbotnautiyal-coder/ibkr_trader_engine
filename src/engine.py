@@ -173,12 +173,18 @@ class AutoTraderEngine:
         self._pending_exits: dict[int, tuple] = {}
         self._pending_exit_times: dict[int, float] = {}  # order_id → epoch
 
+        # Live combo (BAG) market-data subscription keys (= str(pos.db_id)) for the
+        # L2 premium exit vote. One line per open position; swept on close.
+        self._combo_sub_keys: set[str] = set()
+
         self._processor = TickProcessor(
             on_enter_approved=self._on_enter_approved,
             on_skip          =self._on_skip,
             on_exit_checked  =self._on_exit_checked,
             on_heartbeat     =self._on_heartbeat,
             is_live          =not self.dry_run,
+            # Live real-trading only: feed debit-to-close into L2's premium vote.
+            debit_provider   =(None if self.dry_run else self._position_debit),
         )
 
     @property
@@ -191,6 +197,47 @@ class AutoTraderEngine:
                 client_id=CONFIG["ibkr"]["engine_client_id"]
             )
         return self._client
+
+    # -------------------------------------------------------------------------
+    # Live combo marks — L2 premium exit vote (live real-trading only)
+    # -------------------------------------------------------------------------
+
+    def _position_debit(self, pos) -> Optional[float]:
+        """Return the live debit-to-close for an open spread, for L2's premium vote.
+
+        Subscribes one BAG market-data line per position on first use (idempotent),
+        then reads the streaming mark. Returns None until a quote is available, or
+        on any error — in which case L2 simply skips the premium vote and relies on
+        its indicator/price votes. Costs ~1 IBKR data line per open position.
+        """
+        if self.dry_run or pos is None or pos.long_strike is None or pos.db_id is None:
+            return None
+        try:
+            from executor import today_expiry
+            key = str(pos.db_id)
+            right = "C" if pos.side.value == "CALL" else "P"
+            if key not in self._combo_sub_keys:
+                if self.client.subscribe_combo_mark(
+                    key, today_expiry(), pos.short_strike, pos.long_strike, right
+                ):
+                    self._combo_sub_keys.add(key)
+            return self.client.get_combo_debit(key)
+        except Exception as e:
+            self.logger.warning(f"_position_debit(pos={getattr(pos,'db_id',None)}) failed: {e}")
+            return None
+
+    def _sweep_combo_subs(self) -> None:
+        """Cancel combo market-data lines for positions that are no longer open."""
+        if self.dry_run or not self._combo_sub_keys:
+            return
+        try:
+            open_keys = {str(p.db_id) for p in self.store.get_open()}
+        except Exception:
+            return
+        for key in list(self._combo_sub_keys):
+            if key not in open_keys:
+                self.client.unsubscribe_combo_mark(key)
+                self._combo_sub_keys.discard(key)
 
     # -------------------------------------------------------------------------
     # Mode seams — the ONLY behavioral differences between live and backtest.
@@ -1037,6 +1084,7 @@ class AutoTraderEngine:
                 gex_snapshot=None,
                 spx=spx,
                 order_time=bt_order_time,
+                combined=combined,
             )
             self._log_opened(ts, decision, spx, em)
             self.logger.info(
@@ -1123,6 +1171,7 @@ class AutoTraderEngine:
             status="pending_open",
             order_action="OPEN",
             order_time=order_time,
+            combined=combined,
         )
 
         # Record signal before sending order
@@ -1327,6 +1376,7 @@ class AutoTraderEngine:
                     exit_regime=decision.exit_regime,
                     gex_snapshot=None,
                     spx=spx,
+                    combined=combined,
                 )
                 self._record_signal(
                     ts=ts, layer=decision.exit_layer,
@@ -1371,6 +1421,7 @@ class AutoTraderEngine:
                     exit_regime=decision.exit_regime,
                     gex_snapshot=None,
                     spx=spx,
+                    combined=combined,
                 )
                 self._record_signal(
                     ts=ts, layer=decision.exit_layer,
@@ -1400,6 +1451,7 @@ class AutoTraderEngine:
                     exit_regime=decision.exit_regime,
                     gex_snapshot=None,
                     spx=spx,
+                    combined=combined,
                 )
                 self._record_signal(
                     ts=ts, layer=decision.exit_layer,
@@ -1632,6 +1684,9 @@ class AutoTraderEngine:
 
         # TASK-2026-179: Check for stale pending orders (10-min timeout)
         self._check_pending_timeouts()
+
+        # Cancel combo market-data lines for positions closed since last tick
+        self._sweep_combo_subs()
 
         # EOD expiry sweep — once per day after 16:00 ET.
         # Uses self._now() so backtest fires the sweep at the backtest date's

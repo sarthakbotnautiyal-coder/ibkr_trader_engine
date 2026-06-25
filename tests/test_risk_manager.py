@@ -631,6 +631,94 @@ class TestEvaluateExit_L2:
         assert put_result.should_exit is True
 
 
+class TestEvaluateExit_L2_Momentum:
+    """L2 momentum upgrade: 2-of-N adverse-condition vote (trend/vol/momentum/
+    proximity/near_major/premium). Indicator votes let L2 fire before price reaches
+    the strike. Reproduces the PUT-#6 loss scenario."""
+
+    def _put(self, **over):
+        pos = Mock()
+        pos.side = PositionSide.PUT
+        pos.short_strike = 7335.0
+        pos.layer = 1
+        pos.entry_em = 19.6
+        pos.credit = 0.30
+        pos.spread_width = 20.0
+        pos.num_contracts = 1
+        # Entry baselines (the #6 trade at 12:37)
+        pos.entry_spx_spot = 7400.0
+        pos.entry_adx = 10.4
+        pos.entry_rsi = 43.5
+        pos.entry_vix1d = 13.2
+        for k, v in over.items():
+            setattr(pos, k, v)
+        return pos
+
+    def _combined(self, **over):
+        c = Mock()
+        c.regime = "neutral"
+        c.expected_move = 22.0
+        # No GEX major near the strike → near_major vote off unless overridden
+        c.major_positive_by_volume = 0.0
+        c.major_negative_by_volume = 0.0
+        for k, v in over.items():
+            setattr(c, k, v)
+        return c
+
+    def test_exits_on_trend_plus_momentum_before_proximity(self):
+        """#6 scenario at 13:16: SPX 7368 (disp 33 > entry_em, no proximity),
+        ADX 10->20 (trend) + RSI 33<=35 falling (momentum) → 2 votes → EXIT."""
+        pos = self._put()
+        c = self._combined(spx_spot=7368.0, adx=20.1, rsi=33.0, vix1d=15.4)
+        r = evaluate_exit(pos, c)
+        assert r.should_exit is True
+        assert r.exit_layer == 2
+        assert r.exit_conditions_met >= 2
+        assert "trend" in r.reason and "momentum" in r.reason
+
+    def test_single_indicator_vote_stays(self):
+        """Only trend fires (RSI not yet oversold) → 1 vote → STAY."""
+        pos = self._put()
+        c = self._combined(spx_spot=7380.0, adx=20.1, rsi=40.0, vix1d=13.5)
+        r = evaluate_exit(pos, c)
+        assert r.should_exit is False
+        assert r.exit_conditions_met == 1
+
+    def test_no_exit_on_favorable_move(self):
+        """Price RISING (favorable for a short put) → trend/vol/momentum gated off
+        by adverse-direction check even with a vol spike → STAY."""
+        pos = self._put()
+        c = self._combined(spx_spot=7420.0, adx=30.0, rsi=20.0, vix1d=20.0)
+        r = evaluate_exit(pos, c)
+        assert r.should_exit is False
+
+    def test_premium_vote_counts_within_2_of_n(self):
+        """Premium (debit >= 3x credit) + momentum = 2 votes → EXIT; premium alone
+        (1 vote) → STAY (premium is one vote in the 2-of-N, not a hard stop)."""
+        pos = self._put()
+        # debit 0.90 == 3 * 0.30 credit → premium vote on
+        c_one = self._combined(spx_spot=7395.0, adx=11.0, rsi=43.0, vix1d=13.2)
+        r_one = evaluate_exit(pos, c_one, current_debit=0.90)
+        assert r_one.should_exit is False  # only premium → 1 vote
+
+        c_two = self._combined(spx_spot=7368.0, adx=12.0, rsi=33.0, vix1d=13.5)
+        r_two = evaluate_exit(pos, c_two, current_debit=0.90)
+        assert r_two.should_exit is True  # premium + momentum → 2 votes
+        assert "premium" in r_two.reason
+
+    def test_legacy_proximity_plus_near_major_still_exits(self):
+        """Backward-compat: a position with no indicator baselines still exits on
+        the old condition (proximity AND near_major = 2 votes)."""
+        pos = self._put(entry_spx_spot=None, entry_adx=None,
+                        entry_rsi=None, entry_vix1d=None)
+        # disp = |7350-7335| = 15 < entry_em 19.6 (proximity);
+        # major_negative 7340 within current em 22 of strike (near_major)
+        c = self._combined(spx_spot=7350.0, adx=25.0, rsi=30.0, vix1d=18.0,
+                           major_negative_by_volume=7340.0)
+        r = evaluate_exit(pos, c)
+        assert r.should_exit is True
+
+
 # ---------------------------------------------------------------------------
 # FilterResult
 # ---------------------------------------------------------------------------

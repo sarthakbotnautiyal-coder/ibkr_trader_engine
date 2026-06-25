@@ -139,6 +139,13 @@ class _IBThreadState:
         # Set True by main thread to request an explicit reconnect
         self._reconnect_requested = threading.Event()
 
+        # Live combo (BAG) market-data subscriptions for open positions, keyed by
+        # a caller-supplied position key. Holds streaming ib_async Ticker objects
+        # that the IB thread's event loop keeps fresh. Used for the L2 premium
+        # (debit-to-close) exit vote. One BAG line per open position; cancelled on
+        # close. Touched only on the IB thread.
+        self._combo_tickers: Dict[str, Any] = {}
+
 
 # -----------------------------------------------------------------------------
 # IB thread worker
@@ -180,6 +187,9 @@ def _ib_thread_worker(state: _IBThreadState) -> None:
             # Give ib_async time to complete post-connect handshake
             ib.sleep(0.5)
             state._ib = ib
+            # Fresh IB instance → any prior combo tickers are dead. Clear so the
+            # engine re-subscribes cleanly (its per-tick subscribe is idempotent).
+            state._combo_tickers.clear()
             _wire_callbacks(ib)
             state._connected.set()
             _consecutive_failures = 0
@@ -623,6 +633,47 @@ class BlockingIBKRClient:
             return None
 
     # -------------------------------------------------------------------------
+    # Live combo (BAG) marks — for the L2 premium (debit-to-close) exit vote
+    # -------------------------------------------------------------------------
+
+    def subscribe_combo_mark(
+        self, key, expiry: str, short_strike: float, long_strike: float, right: str,
+    ) -> bool:
+        """Open one streaming BAG line for an open position. No-op in DRY_RUN /
+        when disconnected. Idempotent (re-subscribing an existing key is a no-op).
+        """
+        if DRY_RUN or not self.is_connected():
+            return False
+        try:
+            return bool(self._enqueue(
+                _subscribe_combo_impl, self._state, str(key), expiry,
+                short_strike, long_strike, right, self._logger, timeout=10.0,
+            ))
+        except Exception as e:
+            self._logger.warning(f"subscribe_combo_mark({key}) failed: {e}")
+            return False
+
+    def get_combo_debit(self, key) -> Optional[float]:
+        """Current debit-to-close for a subscribed position, or None if no live
+        quote yet / DRY_RUN / disconnected. None simply skips the premium vote."""
+        if DRY_RUN or not self.is_connected():
+            return None
+        try:
+            return self._enqueue(_read_combo_debit_impl, self._state, str(key), timeout=5.0)
+        except Exception as e:
+            self._logger.warning(f"get_combo_debit({key}) failed: {e}")
+            return None
+
+    def unsubscribe_combo_mark(self, key) -> None:
+        """Cancel a position's BAG line (call on close). No-op in DRY_RUN."""
+        if DRY_RUN or not self.is_connected():
+            return
+        try:
+            self._enqueue(_unsubscribe_combo_impl, self._state, str(key), self._logger, timeout=5.0)
+        except Exception as e:
+            self._logger.warning(f"unsubscribe_combo_mark({key}) failed: {e}")
+
+    # -------------------------------------------------------------------------
     # DRY_RUN helpers
     # -------------------------------------------------------------------------
 
@@ -648,6 +699,83 @@ class BlockingIBKRClient:
 # -----------------------------------------------------------------------------
 # Per-call implementations (all run in the IB thread, receive the IB instance)
 # -----------------------------------------------------------------------------
+
+
+def _combo_bag(ib: IB, expiry: str, short_strike: float, long_strike: float, right: str) -> Contract:
+    """Qualify the two legs and build the BAG used to mark an SPX credit spread.
+
+    Uses the same leg layout as an OPEN order (SELL short / BUY long) because only
+    that direction returns a real market from IBKR (bid/ask negative = credit).
+    """
+    short_opt = Option("SPX", expiry, short_strike, right, "SMART", tradingClass="SPXW")
+    long_opt  = Option("SPX", expiry, long_strike,  right, "SMART", tradingClass="SPXW")
+    ib.qualifyContracts(short_opt, long_opt)
+    if not (short_opt.conId and long_opt.conId):
+        raise RuntimeError(
+            f"combo qualify failed short={short_opt.conId} long={long_opt.conId}"
+        )
+    bag = Contract()
+    bag.symbol = "SPX"
+    bag.secType = "BAG"
+    bag.currency = "USD"
+    bag.exchange = "SMART"
+    bag.comboLegs = [
+        ComboLeg(conId=short_opt.conId, ratio=1, action="SELL", exchange="SMART"),
+        ComboLeg(conId=long_opt.conId,  ratio=1, action="BUY",  exchange="SMART"),
+    ]
+    return bag
+
+
+def _subscribe_combo_impl(
+    ib: IB, state: "_IBThreadState", key: str, expiry: str,
+    short_strike: float, long_strike: float, right: str, log: logging.Logger,
+) -> bool:
+    """Open a streaming BAG market-data line for an open position (IB thread)."""
+    if key in state._combo_tickers:
+        return True
+    bag = _combo_bag(ib, expiry, short_strike, long_strike, right)
+    ticker = ib.reqMktData(bag, "", False, False)  # streaming (one line)
+    state._combo_tickers[key] = ticker
+    log.info(
+        f"COMBO_MKTDATA_SUB | key={key} {right} {short_strike:.0f}/{long_strike:.0f} "
+        f"exp={expiry} (1 BAG line)"
+    )
+    return True
+
+
+def _read_combo_debit_impl(ib: IB, state: "_IBThreadState", key: str) -> Optional[float]:
+    """Return current debit-to-close (abs of the BAG mid) for a subscribed position."""
+    import math
+    ticker = state._combo_tickers.get(key)
+    if ticker is None:
+        return None
+
+    def _ok(x) -> bool:
+        return x is not None and not (isinstance(x, float) and math.isnan(x))
+
+    bid, ask = getattr(ticker, "bid", None), getattr(ticker, "ask", None)
+    if _ok(bid) and _ok(ask):
+        mid = (bid + ask) / 2.0
+    elif _ok(getattr(ticker, "close", None)):
+        mid = ticker.close
+    else:
+        return None
+    # BAG bid/ask are negative (you receive credit to open); debit to close = |mid|.
+    return abs(mid)
+
+
+def _unsubscribe_combo_impl(
+    ib: IB, state: "_IBThreadState", key: str, log: logging.Logger,
+) -> bool:
+    """Cancel a position's streaming BAG line on close (IB thread)."""
+    ticker = state._combo_tickers.pop(key, None)
+    if ticker is not None:
+        try:
+            ib.cancelMktData(ticker.contract)
+        except Exception:
+            pass
+        log.info(f"COMBO_MKTDATA_CANCEL | key={key}")
+    return True
 
 
 def _place_order_impl(ib: IB, params: OrderParams, log: logging.Logger) -> int:

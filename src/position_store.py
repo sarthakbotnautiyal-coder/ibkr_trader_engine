@@ -52,45 +52,64 @@ class MarketSnapshot:
     atm_call_mid:   float
     atm_put_mid:    float
     atm_strike:     float
+    vix1d:          float = 0.0
 
     @property
     def bb_position_pct(self) -> float:
         return self.bb_position * 100 if self.bb_position is not None else 50.0
 
 
+def _snapshot_from_combined(combined, em: float = 0.0, gex_val: float = 0.0) -> MarketSnapshot:
+    """Build a MarketSnapshot from a CombinedSnapshot (the combined_reader seam).
+
+    CombinedSnapshot is produced identically in LOCAL, CLOUD and BACKTEST, so a
+    snapshot derived from it is mode-agnostic — no direct SQLite/Supabase reads.
+    """
+    em_v  = em if em else (getattr(combined, "expected_move", 0.0) or 0.0)
+    gex_v = gex_val if gex_val else (getattr(combined, "gex_by_oi", 0.0) or 0.0)
+
+    # Real VIX from the feed; fall back to the EM*16 proxy only if absent.
+    vix_raw = getattr(combined, "vix", None)
+    vix = float(vix_raw) if vix_raw else ((em_v * 16) if em_v > 0 else 0.0)
+    vix1d = float(getattr(combined, "vix1d", 0.0) or 0.0)
+
+    return MarketSnapshot(
+        spx_spot     = combined.spx_spot,
+        vix          = vix,
+        vix1d        = vix1d,
+        em           = em_v,
+        gex          = gex_v,
+        bb_position  = combined.bb_position,
+        bb_expanding = int(bool(combined.bb_expanding)),
+        adx          = combined.adx,
+        macd_hist    = combined.macd_hist,
+        rsi          = combined.rsi,
+        atm_call_mid = combined.atm_call_mid,
+        atm_put_mid  = combined.atm_put_mid,
+        atm_strike   = combined.atm_strike,
+    )
+
+
 def build_market_snapshot(
     em: float = 0.0,
     gex_val: float = 0.0,
+    combined=None,
 ) -> MarketSnapshot:
     """
-    Capture the current market state from TradingView as primary source,
-    with scanner/GEX data for price, EM, GEX, and ATM mid values.
+    Capture the current market state via the combined_reader seam, so entry/exit
+    snapshots are identical in LOCAL and CLOUD mode.
+
+    If ``combined`` is provided (the exact decision snapshot), it is used directly
+    — correct in every mode including BACKTEST. Otherwise the latest combined
+    snapshot is fetched via the mode-aware seam (LOCAL SQLite or CLOUD Supabase).
     """
     try:
-        from tradingview_reader import get_latest_fundamentals
-        from scanner_reader import get_latest_scan
-
-        scan = get_latest_scan()
-        tv = get_latest_fundamentals(gex_expected_move=em)
-
-        vix = (em * 16) if em > 0 else 0.0
-
-        return MarketSnapshot(
-            spx_spot     = tv.price,
-            vix          = vix,
-            em           = em,
-            gex          = gex_val,
-            bb_position  = tv.bb_position,
-            bb_expanding = int(tv.bb_expanding),
-            adx          = tv.adx,
-            macd_hist    = tv.macd_hist,
-            rsi          = tv.rsi,
-            atm_call_mid = scan.atm_call_mid if scan else 0.0,
-            atm_put_mid  = scan.atm_put_mid  if scan else 0.0,
-            atm_strike   = scan.atm_strike   if scan else 0.0,
-        )
+        if combined is None:
+            from combined_reader import get_combined_for_latest_scan
+            combined = get_combined_for_latest_scan()
+        return _snapshot_from_combined(combined, em=em, gex_val=gex_val)
     except Exception as e:
-        _LOG.warning("build_market_snapshot: TV/scan read failed: %s", e)
+        _LOG.warning("build_market_snapshot: combined read failed: %s", e)
         return _empty_snapshot()
 
 
@@ -128,6 +147,15 @@ class TradePosition:
     entry_snapshot: Optional[MarketSnapshot] = None
     entry_em:      Optional[float] = None
     num_contracts: int = 1
+
+    # Entry indicator baselines for momentum-aware L2 exit. Populated at open
+    # (add_position) and on restart (load_open). Used by evaluate_exit to compare
+    # current indicators against entry to detect the market turning against us.
+    entry_spx_spot:  Optional[float] = None
+    entry_adx:       Optional[float] = None
+    entry_rsi:       Optional[float] = None
+    entry_macd_hist: Optional[float] = None
+    entry_vix1d:     Optional[float] = None
 
     def __post_init__(self):
         if not self.open_time:
@@ -267,6 +295,11 @@ class PositionStore:
                     open_time=p.open_time, credit=p.credit,
                     status=p.status, layer=p.layer,
                     notes=p.notes, db_id=p.id, entry_em=p.entry_em,
+                    entry_spx_spot=p.entry_spx_spot,
+                    entry_adx=p.entry_adx,
+                    entry_rsi=p.entry_rsi,
+                    entry_macd_hist=p.entry_macd_hist,
+                    entry_vix1d=p.entry_vix1d,
                 )
                 for p in rows
             ]
@@ -298,6 +331,7 @@ class PositionStore:
         order_id: Optional[int] = None,
         order_action: Optional[str] = None,
         order_time: Optional[str] = None,
+        combined=None,
     ) -> int:
         """
         Persist a new position and capture the entry market snapshot.
@@ -308,8 +342,17 @@ class PositionStore:
           - status='pending_open' in LIVE mode (written BEFORE IBKR confirms fill)
           - order_id/order_action/order_time recorded for LIVE pending orders
         """
-        snapshot = build_market_snapshot(em=em, gex_val=gex_val)
-        pos.entry_em = snapshot.em
+        # Snapshot is built from `combined` (the exact decision tick) when given —
+        # correct in LOCAL, CLOUD and BACKTEST. Falls back to the mode-aware seam.
+        snapshot = build_market_snapshot(em=em, gex_val=gex_val, combined=combined)
+
+        # Entry indicator baselines for momentum-aware L2 exit (all from snapshot).
+        pos.entry_em        = snapshot.em
+        pos.entry_spx_spot  = snapshot.spx_spot
+        pos.entry_adx       = snapshot.adx
+        pos.entry_rsi       = snapshot.rsi
+        pos.entry_macd_hist = snapshot.macd_hist
+        pos.entry_vix1d     = snapshot.vix1d
 
         with get_conn(self.db_path) as conn:
             db_row = Position(
@@ -323,7 +366,7 @@ class PositionStore:
                 max_loss=pos.max_loss, layer=pos.layer, notes=pos.notes,
                 num_contracts=pos.num_contracts,
 
-                # Entry snapshot
+                # Entry snapshot (all fields from the combined-sourced snapshot)
                 entry_spx_spot     = snapshot.spx_spot,
                 entry_vix          = snapshot.vix,
                 entry_em           = snapshot.em,
@@ -336,6 +379,7 @@ class PositionStore:
                 entry_atm_call_mid = snapshot.atm_call_mid,
                 entry_atm_put_mid  = snapshot.atm_put_mid,
                 entry_atm_strike   = snapshot.atm_strike,
+                entry_vix1d        = snapshot.vix1d,
 
                 # Regime metadata
                 entry_regime         = entry_regime,
@@ -384,13 +428,19 @@ class PositionStore:
         spx: float = 0.0,
         fill_price: Optional[float] = None,
         fill_time: Optional[str] = None,
+        combined=None,
     ) -> None:
         """
         Close a position and capture the exit market snapshot.
         Also records exit_regime and exit_rsi.
+
+        `combined` (the exact exit-decision tick) is used for the exit snapshot
+        when provided — correct in every mode. When None (e.g. a pending exit
+        confirmed a few ticks later), the latest combined snapshot is fetched via
+        the mode-aware seam, which is the correct close-time state in LOCAL/CLOUD.
         """
         close_ts = _timestamp_et()
-        snapshot = build_market_snapshot(em=em, gex_val=gex_val)
+        snapshot = build_market_snapshot(em=em, gex_val=gex_val, combined=combined)
 
         with get_conn(self.db_path) as conn:
             update_position_status(conn, db_id, status, close_ts, pnl, notes)
@@ -406,6 +456,7 @@ class PositionStore:
                 exit_layer       = exit_layer,
                 exit_conditions_met = exit_conditions_met,
                 exit_regime      = exit_regime,
+                exit_vix1d       = snapshot.vix1d,
             )
             conn.commit()
 

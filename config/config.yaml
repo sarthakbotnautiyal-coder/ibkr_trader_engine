@@ -61,6 +61,20 @@ entry:
         from_spot: 3.0
         from_gex_level: 1.5
 
+# L2 exit — momentum-aware adverse-condition vote (see risk_manager.evaluate_exit).
+# L1 (hard stop on short-strike cross) is unconditional and not configurable here.
+# L2 counts how many adverse conditions are true vs the entry baseline and exits
+# once >= votes_to_exit fire. All thresholds have safe code-level defaults, so the
+# engine still runs if this section is removed.
+exit:
+  votes_to_exit: 2          # number of adverse conditions required to exit
+  adx_floor: 20.0           # trend vote: ADX must be at/above this (real trend)
+  adx_rise: 8.0             # trend vote: ADX must have risen >= this since entry
+  vix1d_mult: 1.20          # vol vote: VIX1D >= entry_vix1d * this (move expanding)
+  rsi_put: 35.0             # momentum vote (PUT): RSI at/below this and falling
+  rsi_call: 65.0            # momentum vote (CALL): RSI at/above this and rising
+  premium_mult: 3.0         # premium vote: debit-to-close >= credit * this
+
 day_gate:
   enabled: true
   window_minutes: 15
