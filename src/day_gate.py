@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import logging
 import re
-import sqlite3
 import time as _time
 from collections import deque
 from dataclasses import dataclass
@@ -26,6 +25,7 @@ from typing import Optional
 
 from config import CONFIG
 from gex_reader import GEX_DB
+from db_utils import connect_ro_with_retry
 
 
 # ---------------------------------------------------------------------------
@@ -121,16 +121,17 @@ class DayGate:
         parsed_ts = _parse_ts(scan_timestamp)
         window_start_sql = f"datetime('{parsed_ts}', '-{self._window_minutes} minutes')"
 
-        conn = sqlite3.connect(GEX_DB)
-        conn.execute("PRAGMA journal_mode = WAL;")
-        rows = conn.execute(f"""
-            SELECT timestamp, gex_by_oi, spot, zero_gamma
-            FROM gex_snapshots
-            WHERE timestamp >= {window_start_sql}
-              AND timestamp <= ?
-            ORDER BY timestamp ASC
-        """, (parsed_ts,)).fetchall()
-        conn.close()
+        conn = connect_ro_with_retry(GEX_DB, "gex.db")
+        try:
+            rows = conn.execute(f"""
+                SELECT timestamp, gex_by_oi, spot, zero_gamma
+                FROM gex_snapshots
+                WHERE timestamp >= {window_start_sql}
+                  AND timestamp <= ?
+                ORDER BY timestamp ASC
+            """, (parsed_ts,)).fetchall()
+        finally:
+            conn.close()
 
         # Use current time as epoch so prefill entries are "fresh" in the
         # rolling window and not immediately pruned on the first tick.

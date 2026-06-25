@@ -25,13 +25,13 @@ and the engine tick is skipped.
 """
 import re
 import sqlite3
-import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, Iterator
 
 from config import CONFIG
+from db_utils import connect_ro_with_retry
 
 # ---------------------------------------------------------------------------
 # Paths (config-driven — resolved relative to the engine root)
@@ -72,50 +72,10 @@ class StaleDataError(Exception):
 # ---------------------------------------------------------------------------
 # WAL resilience (TASK-2026-235, generalized)
 # ---------------------------------------------------------------------------
-#
-# The engine is a *reader* of scanner.db / gex.db / tradingview.db; each file is
-# written continuously by a separate extractor process in WAL mode. Two things
-# previously made reads fragile and surfaced as
-# ``sqlite3.OperationalError: unable to open database file``:
-#
-#   1. Issuing ``PRAGMA journal_mode = WAL`` on every read. That pragma needs a
-#      write lock and momentarily touches the -wal/-shm sidecars, so it races
-#      the writer. It is also redundant — journal mode is persisted in the DB
-#      header by the writer, so a reader never needs to (re)set it.
-#   2. No connect timeout / retry, so any transient contention failed the tick.
-#
-# Fix: open every local DB read-only via a URI ("mode=ro"), with a busy timeout
-# and short-backoff retry, and never set the journal mode from the reader. A
-# read-only connection coexists cleanly with the WAL writer.
+# All local reads go through the shared WAL-safe read-only connect helper. See
+# db_utils for why the reader must not set ``PRAGMA journal_mode = WAL``.
 
-_DB_CONNECT_MAX_ATTEMPTS = 3
-_DB_CONNECT_BACKOFFS = (0.2, 0.4, 0.6)
-_DB_CONNECT_TIMEOUT = 2.0
-
-
-def _connect_ro_with_retry(db_path: "Path", label: str) -> "sqlite3.Connection":
-    """Open a local SQLite DB read-only, WAL-safe, with short-backoff retry.
-
-    Reader-writer contention on a shared WAL database can surface as
-    ``sqlite3.OperationalError: unable to open database file`` even though the
-    file exists and is readable. We open read-only (no write lock, no journal
-    pragma) with a connect/busy timeout and retry a few times before giving up.
-    """
-    uri = f"file:{db_path}?mode=ro"
-    last_err: Optional[Exception] = None
-    for attempt in range(1, _DB_CONNECT_MAX_ATTEMPTS + 1):
-        try:
-            return sqlite3.connect(uri, uri=True, timeout=_DB_CONNECT_TIMEOUT)
-        except sqlite3.OperationalError as e:
-            last_err = e
-            if attempt < _DB_CONNECT_MAX_ATTEMPTS:
-                time.sleep(_DB_CONNECT_BACKOFFS[attempt - 1])
-                continue
-            break
-    raise RuntimeError(
-        f"Failed to open {label} ({db_path}) read-only after "
-        f"{_DB_CONNECT_MAX_ATTEMPTS} attempts: {last_err}"
-    )
+_connect_ro_with_retry = connect_ro_with_retry
 
 
 # ---------------------------------------------------------------------------
