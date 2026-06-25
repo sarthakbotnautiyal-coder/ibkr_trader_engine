@@ -70,35 +70,51 @@ class StaleDataError(Exception):
 
 
 # ---------------------------------------------------------------------------
-# WAL resilience (TASK-2026-235)
+# WAL resilience (TASK-2026-235, generalized)
 # ---------------------------------------------------------------------------
+#
+# The engine is a *reader* of scanner.db / gex.db / tradingview.db; each file is
+# written continuously by a separate extractor process in WAL mode. Two things
+# previously made reads fragile and surfaced as
+# ``sqlite3.OperationalError: unable to open database file``:
+#
+#   1. Issuing ``PRAGMA journal_mode = WAL`` on every read. That pragma needs a
+#      write lock and momentarily touches the -wal/-shm sidecars, so it races
+#      the writer. It is also redundant — journal mode is persisted in the DB
+#      header by the writer, so a reader never needs to (re)set it.
+#   2. No connect timeout / retry, so any transient contention failed the tick.
+#
+# Fix: open every local DB read-only via a URI ("mode=ro"), with a busy timeout
+# and short-backoff retry, and never set the journal mode from the reader. A
+# read-only connection coexists cleanly with the WAL writer.
 
-_TV_CONNECT_MAX_ATTEMPTS = 3
-_TV_CONNECT_BACKOFFS = (0.2, 0.4, 0.6)
-_TV_CONNECT_TIMEOUT = 2.0
+_DB_CONNECT_MAX_ATTEMPTS = 3
+_DB_CONNECT_BACKOFFS = (0.2, 0.4, 0.6)
+_DB_CONNECT_TIMEOUT = 2.0
 
 
-def _connect_tv_with_retry() -> "sqlite3.Connection":
-    """Open tradingview.db with WAL-aware retry.
+def _connect_ro_with_retry(db_path: "Path", label: str) -> "sqlite3.Connection":
+    """Open a local SQLite DB read-only, WAL-safe, with short-backoff retry.
 
-    Reader-writer contention on the shared tradingview.db can surface as
-    ``sqlite3.OperationalError: unable to open database file`` even though
-    the file exists. Retry with short backoff and a 2s connect timeout.
+    Reader-writer contention on a shared WAL database can surface as
+    ``sqlite3.OperationalError: unable to open database file`` even though the
+    file exists and is readable. We open read-only (no write lock, no journal
+    pragma) with a connect/busy timeout and retry a few times before giving up.
     """
+    uri = f"file:{db_path}?mode=ro"
     last_err: Optional[Exception] = None
-    for attempt in range(1, _TV_CONNECT_MAX_ATTEMPTS + 1):
+    for attempt in range(1, _DB_CONNECT_MAX_ATTEMPTS + 1):
         try:
-            conn = sqlite3.connect(str(TV_DB), timeout=_TV_CONNECT_TIMEOUT)
-            conn.execute("PRAGMA journal_mode = WAL;")
-            return conn
+            return sqlite3.connect(uri, uri=True, timeout=_DB_CONNECT_TIMEOUT)
         except sqlite3.OperationalError as e:
             last_err = e
-            if attempt < _TV_CONNECT_MAX_ATTEMPTS:
-                time.sleep(_TV_CONNECT_BACKOFFS[attempt - 1])
+            if attempt < _DB_CONNECT_MAX_ATTEMPTS:
+                time.sleep(_DB_CONNECT_BACKOFFS[attempt - 1])
                 continue
             break
     raise RuntimeError(
-        f"Failed to open tradingview.db after {_TV_CONNECT_MAX_ATTEMPTS} attempts: {last_err}"
+        f"Failed to open {label} ({db_path}) read-only after "
+        f"{_DB_CONNECT_MAX_ATTEMPTS} attempts: {last_err}"
     )
 
 
@@ -397,53 +413,58 @@ class LocalSource(BaseSource):
     """LOCAL mode — read directly from local SQLite (config-driven paths)."""
 
     def latest_scan(self) -> Optional[dict]:
-        conn = sqlite3.connect(SCANNER_DB)
-        conn.execute("PRAGMA journal_mode = WAL;")
-        row = conn.execute(
-            "SELECT * FROM scan_results ORDER BY timestamp_est DESC LIMIT 1"
-        ).fetchone()
-        conn.close()
-        return _scan_tuple_to_dict(row) if row else None
-
-    def scan_at(self, scan_ts: str) -> Optional[dict]:
-        conn = sqlite3.connect(SCANNER_DB)
-        conn.execute("PRAGMA journal_mode = WAL;")
-        row = conn.execute(
-            "SELECT * FROM scan_results WHERE timestamp_est = ? LIMIT 1", (scan_ts,)
-        ).fetchone()
-        if row is None:
+        conn = _connect_ro_with_retry(SCANNER_DB, "scanner.db")
+        try:
             row = conn.execute(
                 "SELECT * FROM scan_results ORDER BY timestamp_est DESC LIMIT 1"
             ).fetchone()
-        conn.close()
+        finally:
+            conn.close()
+        return _scan_tuple_to_dict(row) if row else None
+
+    def scan_at(self, scan_ts: str) -> Optional[dict]:
+        conn = _connect_ro_with_retry(SCANNER_DB, "scanner.db")
+        try:
+            row = conn.execute(
+                "SELECT * FROM scan_results WHERE timestamp_est = ? LIMIT 1", (scan_ts,)
+            ).fetchone()
+            if row is None:
+                row = conn.execute(
+                    "SELECT * FROM scan_results ORDER BY timestamp_est DESC LIMIT 1"
+                ).fetchone()
+        finally:
+            conn.close()
         return _scan_tuple_to_dict(row) if row else None
 
     def gex_in_window(self, scan_ts: str) -> Optional[dict]:
-        conn = sqlite3.connect(GEX_DB)
-        conn.execute("PRAGMA journal_mode = WAL;")
-        window_start_sql, upper_bound, _ = _window_clause(scan_ts)
-        row = conn.execute(f"""
-            SELECT * FROM gex_snapshots
-            WHERE timestamp >= {window_start_sql} AND timestamp <= ?
-            ORDER BY timestamp DESC LIMIT 1
-        """, (upper_bound,)).fetchone()
-        conn.close()
+        conn = _connect_ro_with_retry(GEX_DB, "gex.db")
+        try:
+            window_start_sql, upper_bound, _ = _window_clause(scan_ts)
+            row = conn.execute(f"""
+                SELECT * FROM gex_snapshots
+                WHERE timestamp >= {window_start_sql} AND timestamp <= ?
+                ORDER BY timestamp DESC LIMIT 1
+            """, (upper_bound,)).fetchone()
+        finally:
+            conn.close()
         return _gex_tuple_to_dict(row) if row else None
 
     def tv_in_window(self, scan_ts: str) -> tuple[Optional[dict], Optional[dict]]:
-        conn = _connect_tv_with_retry()
-        window_start_sql, _, upper_bound_tv = _window_clause(scan_ts)
-        rows = conn.execute(f"""
-            SELECT * FROM spx_standardized
-            WHERE received_at >= {window_start_sql} AND received_at <= ?
-              AND alert_category = 'indicator_snapshot'
-              AND alert_type = 'fundamentals'
-              AND price IS NOT NULL
-              AND bb_upper IS NOT NULL AND bb_lower IS NOT NULL
-              AND bb_upper != bb_lower
-            ORDER BY received_at DESC LIMIT 2
-        """, (upper_bound_tv,)).fetchall()
-        conn.close()
+        conn = _connect_ro_with_retry(TV_DB, "tradingview.db")
+        try:
+            window_start_sql, _, upper_bound_tv = _window_clause(scan_ts)
+            rows = conn.execute(f"""
+                SELECT * FROM spx_standardized
+                WHERE received_at >= {window_start_sql} AND received_at <= ?
+                  AND alert_category = 'indicator_snapshot'
+                  AND alert_type = 'fundamentals'
+                  AND price IS NOT NULL
+                  AND bb_upper IS NOT NULL AND bb_lower IS NOT NULL
+                  AND bb_upper != bb_lower
+                ORDER BY received_at DESC LIMIT 2
+            """, (upper_bound_tv,)).fetchall()
+        finally:
+            conn.close()
         if not rows:
             return None, None
         latest = _tv_tuple_to_dict(rows[0])
@@ -454,14 +475,15 @@ class LocalSource(BaseSource):
         # Use substr() rather than date(): scanner timestamps are stored ISO-8601
         # with a timezone offset ('2026-06-18T16:00:20-0400') that SQLite's
         # date() cannot parse. The leading 10 chars are always 'YYYY-MM-DD'.
-        conn = sqlite3.connect(SCANNER_DB)
-        conn.execute("PRAGMA journal_mode = WAL;")
-        rows = conn.execute("""
-            SELECT timestamp_est FROM scan_results
-            WHERE substr(timestamp_est, 1, 10) = ?
-            ORDER BY timestamp_est ASC
-        """, (date_str,)).fetchall()
-        conn.close()
+        conn = _connect_ro_with_retry(SCANNER_DB, "scanner.db")
+        try:
+            rows = conn.execute("""
+                SELECT timestamp_est FROM scan_results
+                WHERE substr(timestamp_est, 1, 10) = ?
+                ORDER BY timestamp_est ASC
+            """, (date_str,)).fetchall()
+        finally:
+            conn.close()
         return [r[0] for r in rows]
 
 
