@@ -150,6 +150,46 @@ def _parse_ts(ts: str) -> str:
     return ts.replace('T', ' ')
 
 
+def _to_et_naive(raw) -> Optional[datetime]:
+    """Parse an ISO-8601 timestamp into a naive ET ``datetime`` for comparison.
+
+    CLOUD-only helper. Timezone-aware values (``Z``, ``+00:00``, ``-04:00`` …)
+    are converted to America/New_York and then stripped of tzinfo. Naive values
+    are assumed to already be ET. Returns ``None`` when unparseable.
+
+    Critically, fractional seconds are removed WITHOUT discarding any trailing
+    timezone offset — the previous ``raw_str.split('.')[0]`` dropped the offset
+    along with the microseconds (the offset follows the fractional part), which
+    silently reinterpreted UTC timestamps as ET and pushed every cloud row 4–5
+    hours out of the freshness window.
+    """
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    # Drop fractional seconds only (offsets never contain a '.').
+    s = re.sub(r'\.\d+', '', s)
+    # Normalize a trailing 'Z' and a colon-less offset for fromisoformat.
+    if s.endswith('Z'):
+        s = s[:-1] + '+00:00'
+    s = re.sub(r'([+-]\d{2})(\d{2})$', r'\1:\2', s)
+    s_iso = s.replace(' ', 'T')
+    try:
+        dt = datetime.fromisoformat(s_iso)
+    except ValueError:
+        # Last resort: strip any offset and parse as naive ET.
+        s_naive = re.sub(r'[-+]\d{2}:?\d{2}$', '', s).replace('T', ' ')
+        try:
+            return datetime.strptime(s_naive, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return None
+    if dt.tzinfo is not None:
+        from zoneinfo import ZoneInfo
+        dt = dt.astimezone(ZoneInfo("America/New_York")).replace(tzinfo=None)
+    return dt
+
+
 def _window_start_dt(scan_ts: str) -> datetime:
     """Return the window-start datetime (scan_ts - FRESHNESS minutes)."""
     parsed = _parse_ts(scan_ts)
@@ -458,40 +498,11 @@ class CloudSource(BaseSource):
         stripping the zone; naive timestamps are assumed to already be ET.
         """
         win_start = _window_start_dt(scan_ts)
-        upper = datetime.strptime(_parse_ts(scan_ts).split('.')[0], "%Y-%m-%d %H:%M:%S")
+        upper = _to_et_naive(scan_ts)
         out = []
         for r in rows:
-            raw = r.get(ts_key)
-            if not raw:
-                continue
-            try:
-                raw_str = str(raw).strip()
-                # Try to parse as ISO 8601 with timezone info
-                # Examples: "2026-06-24T14:10:20Z", "2026-06-24T14:10:20+00:00", "2026-06-24T10:10:20-04:00"
-                try:
-                    from datetime import timezone as tz_module
-                    # Remove fractional seconds for consistent parsing
-                    iso_str = raw_str.split('.')[0]
-                    # Try full ISO with timezone
-                    if 'T' in iso_str:
-                        if iso_str.endswith('Z'):
-                            dt_tz = datetime.fromisoformat(iso_str.replace('Z', '+00:00'))
-                        else:
-                            dt_tz = datetime.fromisoformat(iso_str)
-                        # Convert to ET (naive) for comparison
-                        if dt_tz.tzinfo is not None:
-                            from zoneinfo import ZoneInfo
-                            et = ZoneInfo("America/New_York")
-                            dt = dt_tz.astimezone(et).replace(tzinfo=None)
-                        else:
-                            dt = dt_tz
-                    else:
-                        # Naive timestamp — assume already ET
-                        dt = datetime.strptime(iso_str, "%Y-%m-%d %H:%M:%S")
-                except (ValueError, AttributeError):
-                    # Fall back to naive parsing (strip timezone)
-                    dt = datetime.strptime(_parse_ts(raw_str).split('.')[0], "%Y-%m-%d %H:%M:%S")
-            except ValueError:
+            dt = _to_et_naive(r.get(ts_key))
+            if dt is None:
                 continue
             if win_start <= dt <= upper:
                 out.append((dt, r))
