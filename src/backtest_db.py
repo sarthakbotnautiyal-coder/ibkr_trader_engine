@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Any
@@ -123,11 +124,39 @@ def init_backtest_db() -> None:
 
     TASK-2026-174: backtest_positions now includes all exit-tracking columns
     to match live positions table schema.
+
+    Includes automatic WAL recovery if the database is corrupted.
     """
     Path(BACKTEST_DB).parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(BACKTEST_DB)
-    conn.execute("PRAGMA journal_mode = WAL;")
-    conn.execute("PRAGMA busy_timeout = 10000;")
+
+    wal_path = Path(BACKTEST_DB).with_suffix(Path(BACKTEST_DB).suffix + "-wal")
+    shm_path = Path(BACKTEST_DB).with_suffix(Path(BACKTEST_DB).suffix + "-shm")
+
+    retry_count = 0
+    max_retries = 2
+    while retry_count < max_retries:
+        try:
+            conn = sqlite3.connect(str(BACKTEST_DB), timeout=5.0)
+            conn.execute("PRAGMA journal_mode = WAL;")
+            conn.execute("PRAGMA busy_timeout = 10000;")
+            break
+        except sqlite3.OperationalError as e:
+            if "unable to open database file" in str(e) and retry_count < max_retries - 1:
+                print(f"[Backtest DB] Recovering from WAL corruption...")
+                if wal_path.exists():
+                    try:
+                        wal_path.unlink()
+                    except OSError:
+                        pass
+                if shm_path.exists():
+                    try:
+                        shm_path.unlink()
+                    except OSError:
+                        pass
+                time.sleep(0.5)
+                retry_count += 1
+                continue
+            raise
 
     # --- backtest_signals (TASK-2026-126: mirrors live signals schema) ---
     # TASK-2026-174: decision column included to match live signals

@@ -12,6 +12,7 @@ Layout:
   data/backtests/run_<id>_<date>.db        — one run's positions/signals (trades_db schema)
 """
 import sqlite3
+import time
 from pathlib import Path
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -40,28 +41,75 @@ def _ensure_dir() -> None:
 
 
 def init_registry() -> None:
-    """Create the backtest_runs registry table if absent."""
+    """Create the backtest_runs registry table if absent. Includes WAL recovery."""
     _ensure_dir()
-    conn = sqlite3.connect(_INDEX_DB)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS backtest_runs (
-            id            INTEGER PRIMARY KEY AUTOINCREMENT,
-            backtest_date TEXT NOT NULL,
-            db_path       TEXT,
-            created_at    TEXT NOT NULL,
-            completed_at  TEXT,
-            status        TEXT DEFAULT 'running',
-            ticks         INTEGER DEFAULT 0,
-            total_signals INTEGER DEFAULT 0,
-            total_positions INTEGER DEFAULT 0,
-            open_positions  INTEGER DEFAULT 0,
-            closed_positions INTEGER DEFAULT 0,
-            total_pnl     REAL DEFAULT 0.0
-        )
-    """)
-    conn.commit()
-    conn.close()
-    _LOG.info(f"Backtest registry ready: {_INDEX_DB}")
+
+    wal_path = _INDEX_DB.with_suffix(_INDEX_DB.suffix + "-wal")
+    shm_path = _INDEX_DB.with_suffix(_INDEX_DB.suffix + "-shm")
+
+    try:
+        conn = sqlite3.connect(str(_INDEX_DB), timeout=5.0)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS backtest_runs (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                backtest_date TEXT NOT NULL,
+                db_path       TEXT,
+                created_at    TEXT NOT NULL,
+                completed_at  TEXT,
+                status        TEXT DEFAULT 'running',
+                ticks         INTEGER DEFAULT 0,
+                total_signals INTEGER DEFAULT 0,
+                total_positions INTEGER DEFAULT 0,
+                open_positions  INTEGER DEFAULT 0,
+                closed_positions INTEGER DEFAULT 0,
+                total_pnl     REAL DEFAULT 0.0
+            )
+        """)
+        conn.commit()
+        conn.close()
+        _LOG.info(f"Backtest registry ready: {_INDEX_DB}")
+    except sqlite3.OperationalError as e:
+        if "unable to open database file" in str(e):
+            _LOG.info(f"Recovering from WAL corruption at {_INDEX_DB}...")
+            if wal_path.exists():
+                try:
+                    wal_path.unlink()
+                    _LOG.info(f"Removed stale WAL: {wal_path}")
+                except OSError as e:
+                    _LOG.warning(f"Failed to remove WAL: {e}")
+            if shm_path.exists():
+                try:
+                    shm_path.unlink()
+                    _LOG.info(f"Removed stale SHM: {shm_path}")
+                except OSError as e:
+                    _LOG.warning(f"Failed to remove SHM: {e}")
+            time.sleep(0.5)
+            try:
+                conn = sqlite3.connect(str(_INDEX_DB), timeout=5.0)
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS backtest_runs (
+                        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                        backtest_date TEXT NOT NULL,
+                        db_path       TEXT,
+                        created_at    TEXT NOT NULL,
+                        completed_at  TEXT,
+                        status        TEXT DEFAULT 'running',
+                        ticks         INTEGER DEFAULT 0,
+                        total_signals INTEGER DEFAULT 0,
+                        total_positions INTEGER DEFAULT 0,
+                        open_positions  INTEGER DEFAULT 0,
+                        closed_positions INTEGER DEFAULT 0,
+                        total_pnl     REAL DEFAULT 0.0
+                    )
+                """)
+                conn.commit()
+                conn.close()
+                _LOG.info("Backtest registry recovery successful")
+            except Exception as e:
+                _LOG.error(f"Recovery failed: {e}")
+                raise
+        else:
+            raise
 
 
 def create_run(backtest_date: str) -> tuple[int, Path]:
