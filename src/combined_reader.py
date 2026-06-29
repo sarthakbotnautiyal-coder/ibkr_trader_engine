@@ -24,14 +24,13 @@ If either GEX or TV has no row within that window, StaleDataError is raised
 and the engine tick is skipped.
 """
 import re
-import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, Iterator
 
 from config import CONFIG
-from db_utils import connect_ro_with_retry
+from db_utils import connect_ro_with_retry, execute_ro_with_retry
 
 # ---------------------------------------------------------------------------
 # Paths (config-driven — resolved relative to the engine root)
@@ -70,10 +69,17 @@ class StaleDataError(Exception):
 
 
 # ---------------------------------------------------------------------------
-# WAL resilience (TASK-2026-235, generalized)
+# WAL resilience (TASK-2026-235, generalized; read-path retry TASK-2026-285)
 # ---------------------------------------------------------------------------
 # All local reads go through the shared WAL-safe read-only connect helper. See
 # db_utils for why the reader must not set ``PRAGMA journal_mode = WAL``.
+#
+# connect_ro_with_retry() retries the sqlite3.connect() call, but the SELECT
+# that follows can still raise sqlite3.OperationalError (database locked / WAL
+# busy / disk I/O). The read path wraps every fetchone() with
+# execute_ro_with_retry() so transient contention doesn't blind the engine.
+# Today's incident (2026-06-29): 559 such errors between 11:04:49 and 14:28:48
+# ET, engine blind to scanner data for 3h 28m.
 
 _connect_ro_with_retry = connect_ro_with_retry
 
@@ -410,14 +416,21 @@ class BaseSource:
 
 
 class LocalSource(BaseSource):
-    """LOCAL mode — read directly from local SQLite (config-driven paths)."""
+    """LOCAL mode — read directly from local SQLite (config-driven paths).
+
+    Every ``fetchone()`` is wrapped in ``execute_ro_with_retry()`` so transient
+    SQLite contention (database locked / WAL busy / disk I/O) is retried
+    instead of propagating raw. ``fetchall()`` calls are left unwrapped —
+    they were not implicated in the 2026-06-29 incident.
+    """
 
     def latest_scan(self) -> Optional[dict]:
         conn = _connect_ro_with_retry(SCANNER_DB, "scanner.db")
         try:
-            row = conn.execute(
-                "SELECT * FROM scan_results ORDER BY timestamp_est DESC LIMIT 1"
-            ).fetchone()
+            row = execute_ro_with_retry(
+                conn,
+                "SELECT * FROM scan_results ORDER BY timestamp_est DESC LIMIT 1",
+            )
         finally:
             conn.close()
         return _scan_tuple_to_dict(row) if row else None
@@ -425,13 +438,16 @@ class LocalSource(BaseSource):
     def scan_at(self, scan_ts: str) -> Optional[dict]:
         conn = _connect_ro_with_retry(SCANNER_DB, "scanner.db")
         try:
-            row = conn.execute(
-                "SELECT * FROM scan_results WHERE timestamp_est = ? LIMIT 1", (scan_ts,)
-            ).fetchone()
+            row = execute_ro_with_retry(
+                conn,
+                "SELECT * FROM scan_results WHERE timestamp_est = ? LIMIT 1",
+                (scan_ts,),
+            )
             if row is None:
-                row = conn.execute(
-                    "SELECT * FROM scan_results ORDER BY timestamp_est DESC LIMIT 1"
-                ).fetchone()
+                row = execute_ro_with_retry(
+                    conn,
+                    "SELECT * FROM scan_results ORDER BY timestamp_est DESC LIMIT 1",
+                )
         finally:
             conn.close()
         return _scan_tuple_to_dict(row) if row else None
@@ -440,11 +456,15 @@ class LocalSource(BaseSource):
         conn = _connect_ro_with_retry(GEX_DB, "gex.db")
         try:
             window_start_sql, upper_bound, _ = _window_clause(scan_ts)
-            row = conn.execute(f"""
+            row = execute_ro_with_retry(
+                conn,
+                f"""
                 SELECT * FROM gex_snapshots
                 WHERE timestamp >= {window_start_sql} AND timestamp <= ?
                 ORDER BY timestamp DESC LIMIT 1
-            """, (upper_bound,)).fetchone()
+                """,
+                (upper_bound,),
+            )
         finally:
             conn.close()
         return _gex_tuple_to_dict(row) if row else None
