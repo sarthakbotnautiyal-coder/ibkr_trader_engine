@@ -19,12 +19,20 @@ TASK-2026-179: Polling-only state sync (no callbacks as primary mechanism).
   - reqAllOpenOrders(): returns list of all open Trade objects
   - query_order_status(): returns Trade for specific order_id or None
   - Callbacks still fire for logging, but engine uses polling results
+
+TASK-2026-275: On Error 326 ("client id already in use") the connect path
+  calls sys.exit(2) immediately. The previous PR #10 added a client-id
+  rotation ladder that turned a one-shot collision into a 3h40m retry
+  storm (TASK-2026-278). The ladder has been removed; on collision we
+  crash fast so the watchdog (TASK-2026-276) can back off instead of
+  restarting both processes every 5 min.
 """
 from __future__ import annotations
 
 import logging
 import os
 import queue
+import sys
 import threading
 import time
 from pathlib import Path
@@ -39,29 +47,6 @@ from src.log_setup import get_engine_logger
 _LOGS_DIR = Path(__file__).parent.parent / CONFIG["paths"]["logs"]
 
 T = TypeVar("T")
-
-# Client-id fallback ladder. When the configured engine client id is already in
-# use by a stale session (IB Error 326), the background connect loop cycles
-# through base+offset for these offsets so a dead connection can't lock the
-# engine out indefinitely. The leading 0 is the configured id itself; alternates
-# are spaced by 100 to avoid colliding with sibling components (scanner/spot ids).
-_CLIENT_ID_FALLBACK_OFFSETS = (0, 100, 200, 300, 400, 500, 600, 700, 800, 900)
-
-
-def _compute_client_id(base: int, consecutive_failures: int) -> int:
-    """Pick the client id to try given how many consecutive connects have failed.
-
-    The first two attempts use the configured base id. After that the base is
-    almost certainly held by a stale session (IB Error 326), so cycle through
-    base+offset alternates. Offsets are always computed from the fixed base, so
-    the id range stays bounded and resets to the base after a clean connect.
-    """
-    if consecutive_failures < 2:
-        return base
-    n = len(_CLIENT_ID_FALLBACK_OFFSETS) - 1  # exclude the leading 0 offset
-    idx = ((consecutive_failures - 2) % n) + 1
-    return base + _CLIENT_ID_FALLBACK_OFFSETS[idx]
-
 
 # TASK-2026-277: PID-hash client id derivation.
 #
@@ -238,9 +223,15 @@ def _ib_thread_worker(state: _IBThreadState) -> None:
         Attempt to connect once using a fresh IB instance. Returns True on
         success, False on failure. Never raises — all errors are caught and
         logged. Creates a new IB() each attempt to avoid stale event-loop state.
+
+        TASK-2026-275: On Error 326 ("client id already in use") we exit(2)
+        immediately. This is the first-line defense against the retry-storm
+        the rotation ladder (PR #10) caused: two instances both grab a
+        client_id, both collide, both rotate, both collide again — for hours.
+        Exiting with code 2 lets the watchdog (TASK-2026-276) back off 15 min
+        instead of restarting in 5 min and creating the same collision.
         """
         nonlocal _consecutive_failures
-        eff_id = _compute_client_id(client_id, _consecutive_failures)
         ib = IB()
 
         # Capture connection-level IB errors (reqId < 0) so a failed connect
@@ -255,12 +246,12 @@ def _ib_thread_worker(state: _IBThreadState) -> None:
 
         ib.errorEvent += _capture_err
         try:
-            ib.connect(host, port, clientId=eff_id, timeout=15, readonly=False)
+            ib.connect(host, port, clientId=client_id, timeout=15, readonly=False)
             # Give ib_async time to complete post-connect handshake
             ib.sleep(0.5)
             ib.errorEvent -= _capture_err
             state._ib = ib
-            state.client_id = eff_id  # record the id that actually worked
+            state.client_id = client_id  # record the id that actually worked
             # Fresh IB instance → any prior combo tickers are dead. Clear so the
             # engine re-subscribes cleanly (its per-tick subscribe is idempotent).
             # This is also the restart/reconnect recovery path: open positions are
@@ -272,10 +263,30 @@ def _ib_thread_worker(state: _IBThreadState) -> None:
             state._connected.set()
             _consecutive_failures = 0
             state.log.info(
-                f"IBKR connected {host}:{port} client_id={eff_id}"
+                f"IBKR connected {host}:{port} client_id={client_id}"
             )
             return True
         except Exception as e:
+            # TASK-2026-275: Failfast on duplicate clientId.
+            # Error 326 = "client id already in use". Another instance of
+            # ibkr_trader_engine is already connected with this client_id —
+            # we are the duplicate, exit so the watchdog can back off.
+            if captured["code"] == 326:
+                state.log.error(
+                    f"clientId {client_id} already in use — another "
+                    f"ibkr_trader_engine instance is running. "
+                    f"Exiting 2 so the watchdog (TASK-2026-276) can back off "
+                    f"instead of restart-loop."
+                )
+                try:
+                    ib.errorEvent -= _capture_err
+                except Exception:
+                    pass
+                try:
+                    ib.disconnect()
+                except Exception:
+                    pass
+                sys.exit(2)
             code = captured["code"]
             if code:
                 detail = f" [IB error {code}: {captured['msg']}]"
@@ -286,7 +297,7 @@ def _ib_thread_worker(state: _IBThreadState) -> None:
                 )
             else:
                 detail = ""
-            state.log.warning(f"Connect failed (clientId={eff_id}): {e!r}{detail}")
+            state.log.warning(f"Connect failed (clientId={client_id}): {e!r}{detail}")
             try:
                 ib.errorEvent -= _capture_err
             except Exception:
