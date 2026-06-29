@@ -192,9 +192,18 @@ class AutoTraderEngine:
         if self._client is None:
             from executor import IBKRClient
             from config import CONFIG
+            # TASK-2026-277: PID-hash the client_id off the configured base
+            # (default 31) so concurrent engine starts on the same host get
+            # distinct client_ids by construction. Override the base via the
+            # `IBKR_CLIENT_ID_BASE` env var. See
+            # src/blocking_ib_client.py::compute_client_id_from_pid for the
+            # full rationale and collision math.
+            from src.blocking_ib_client import compute_client_id_from_pid
             self._client = IBKRClient(
                 port=CONFIG["ibkr"]["port"],
-                client_id=CONFIG["ibkr"]["engine_client_id"]
+                client_id=compute_client_id_from_pid(
+                    CONFIG["ibkr"]["engine_client_id"]
+                ),
             )
         return self._client
 

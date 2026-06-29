@@ -23,6 +23,7 @@ TASK-2026-179: Polling-only state sync (no callbacks as primary mechanism).
 from __future__ import annotations
 
 import logging
+import os
 import queue
 import threading
 import time
@@ -60,6 +61,36 @@ def _compute_client_id(base: int, consecutive_failures: int) -> int:
     n = len(_CLIENT_ID_FALLBACK_OFFSETS) - 1  # exclude the leading 0 offset
     idx = ((consecutive_failures - 2) % n) + 1
     return base + _CLIENT_ID_FALLBACK_OFFSETS[idx]
+
+
+# TASK-2026-277: PID-hash client id derivation.
+#
+# Default client_id from `IBKR_CLIENT_ID_BASE` env var (falls back to the
+# `base` arg) plus (os.getpid() % 1000). Hash-based offsets give concurrent
+# starts unique client_ids by construction: today's incident (2026-06-29,
+# TASK-2026-278) saw two simultaneous engine starts both grab client_id=31
+# and enter a 3h40m retry storm. IBKR allows ~32 clientIds per host, but
+# modulo 1000 gives 1000 unique values; realistic concurrency is 1-2
+# instances, so collisions are extremely unlikely. Override the base via
+# the `IBKR_CLIENT_ID_BASE` env var (e.g. for tests or fleet pinning).
+_CLIENT_ID_PID_HASH_MOD = 1000
+
+
+def compute_client_id_from_pid(base: int) -> int:
+    """Derive a client_id from the process id (PID hash) to preempt concurrent-start collisions.
+
+    Returns ``effective_base + (os.getpid() % _CLIENT_ID_PID_HASH_MOD)`` where
+    ``effective_base`` is ``IBKR_CLIENT_ID_BASE`` if set, else ``base``. Two
+    simultaneous engine starts on the same host will (almost certainly) get
+    different client_ids by construction — no more two-process retry storm
+    when a stale session holds the configured id.
+
+    Override the base with the ``IBKR_CLIENT_ID_BASE`` env var; the ``base``
+    arg is ignored in that case.
+    """
+    env_base = os.environ.get("IBKR_CLIENT_ID_BASE")
+    effective_base = int(env_base) if env_base else int(base)
+    return effective_base + (os.getpid() % _CLIENT_ID_PID_HASH_MOD)
 
 
 def _setup_logger(name: str = __name__) -> logging.Logger:
@@ -476,10 +507,17 @@ class BlockingIBKRClient:
         port: int = 7497,
         client_id: int = None,
     ):
-        import os as _os
+        # TASK-2026-277: default client_id is PID-hashed (modulo 1000) off the
+        # configured engine base id (31 by default), so concurrent starts get
+        # distinct ids by construction. Caller can still pin a literal id by
+        # passing it explicitly (the engine does this through
+        # `compute_client_id_from_pid(CONFIG["ibkr"]["engine_client_id"])`).
         self.host = host
         self.port = port
-        self.client_id = client_id if client_id is not None else (_os.getpid() % 100) + 1
+        self.client_id = (
+            client_id if client_id is not None
+            else compute_client_id_from_pid(31)
+        )
         self._logger = _setup_logger("executor.ibkr")
         self._state = _IBThreadState(host, port, self.client_id, self._logger)
 
