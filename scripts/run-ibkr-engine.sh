@@ -27,6 +27,20 @@
 #   treat it as a leftover from a previous SIGKILL'd wrapper and try to clean
 #   it before bailing. Cleanup is best-effort — the worst case is the next
 #   wrapper also fails and the watchdog continues to retry.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# Last-exit sentinel for watchdog backoff (TASK-2026-276)
+# ─────────────────────────────────────────────────────────────────────────────
+# After the engine is forked, a tiny reaper subshell waits on the child PID in
+# the background and writes /tmp/ibkr-engine.last_exit = "<exit_code> <epoch>"
+# once the engine actually exits. The watchdog reads this sentinel to detect
+# exit code 2 (duplicate clientId — added in PR #17 / TASK-2026-275) and
+# back off 15 min instead of entering a 5-min restart loop.
+#
+# The reaper is a separate process so the wrapper's main flow stays
+# fire-and-forget — cron START at 09:35 returns 0 promptly. The reaper's
+# SIGKILL'd-tail caveat is benign: at worst the sentinel file is missing and
+# the watchdog falls through to the default restart path.
 
 set -u
 
@@ -41,6 +55,9 @@ LOG_PATH="$LOG_DIR/$LOG_FILE"
 LOCK_FILE="/tmp/ibkr-engine-launch.lock"
 LOCKDIR="/tmp/ibkr-engine-launch.lockdir"
 LOCK_STALE_SECS=300
+
+# Last-exit sentinel read by ibkr-engine-watchdog.sh (TASK-2026-276).
+EXIT_STATE_FILE="/tmp/ibkr-engine.last_exit"
 
 mkdir -p "$LOG_DIR"
 
@@ -93,6 +110,31 @@ release_lock() {
 }
 
 # ---------------------------------------------------------------------------
+# Last-exit sentinel helpers (TASK-2026-276)
+# ---------------------------------------------------------------------------
+# Spawn an asynchronous reaper that waits on $1 (the engine PID) and writes
+# the sentinel file when it dies. The reaper outlives the wrapper — cron
+# START at 09:35 returns 0 immediately, the reaper persists, and writes the
+# state file when the engine later exits (minutes or hours later).
+spawn_exit_reaper() {
+    local engine_pid="$1"
+    if [ -z "$engine_pid" ]; then
+        return 0
+    fi
+    # Use a subshell with explicit fd redirections to avoid leaking the
+    # wrapper's log_path / state-file handles. The reaper is disowned so it
+    # survives the wrapper's exit; if the wrapper is SIGKILL'd the reaper
+    # inherits the engine as init-adopted and still completes its wait.
+    (
+        wait "$engine_pid"
+        local rc=$?
+        echo "$rc $(date +%s)" > "$EXIT_STATE_FILE"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] run-ibkr-engine.sh: reaper wrote $EXIT_STATE_FILE = $rc for PID $engine_pid" >> "$LOG_PATH"
+    ) &
+    disown 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------------------
 # Launch critical section — guarded by the mutex
 # ---------------------------------------------------------------------------
 if ! acquire_lock; then
@@ -137,6 +179,11 @@ disown
 # Write pidfile atomically
 echo "$NEW_PID" > "$PID_FILE"
 
+# TASK-2026-276: spawn the exit-code reaper BEFORE the 2s health check so the
+# reaper attaches to the engine PID regardless of whether the engine survives
+# past the 2s window. The reaper is fire-and-forget — see spawn_exit_reaper().
+spawn_exit_reaper "$NEW_PID"
+
 # Give the process 2 seconds to either crash or settle, then verify.
 sleep 2
 if kill -0 "$NEW_PID" 2>/dev/null; then
@@ -146,6 +193,9 @@ if kill -0 "$NEW_PID" 2>/dev/null; then
 else
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] run-ibkr-engine.sh: process died within 2s of launch (PID $NEW_PID)" >> "$LOG_PATH"
     rm -f "$PID_FILE"
+    # The reaper will write the sentinel with exit code 143/137 (SIGTERM/SIGKILL)
+    # OR the engine's own sys.exit code if the python side raced ahead — the
+    # watchdog treats any non-2 exit as "no backoff", so this is safe.
     release_lock
     exit 1
 fi
