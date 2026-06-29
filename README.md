@@ -311,6 +311,13 @@ Add to crontab (`crontab -e`):
 */5 * * * * /Users/ubexbot/.openclaw/scripts/ibkr-engine-watchdog.sh
 ```
 
+> **Production cadence (START + STOP + WATCHDOG) is documented in
+> [`docs/CRON.md`](docs/CRON.md).** The simple watchdog-only pattern above
+> works for development, but production uses a market-aware START at 09:35 ET
+> (staggered off `:30` to avoid colliding with the `*/5` watchdog tick ---
+> see TASK-2026-268) plus a STOP at 16:05 ET. The crontab itself lives on the
+> host, not in this repo.
+
 ---
 
 ## ☁️ Cloud Mode (Supabase)
