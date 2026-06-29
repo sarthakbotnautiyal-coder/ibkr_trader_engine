@@ -11,6 +11,7 @@ TASK-2026-179: Pending-state protocol for live trading.
   - update_position_fill() helper to record fill confirmation
 """
 import sqlite3
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -122,10 +123,58 @@ CREATE TABLE IF NOT EXISTS signals (
 
 
 def get_conn(path: Path = DB_PATH) -> sqlite3.Connection:
-    conn = sqlite3.connect(path)
-    conn.execute("PRAGMA foreign_keys = ON;")
-    conn.execute("PRAGMA journal_mode = WAL;")
-    return conn
+    """
+    Get a database connection with automatic WAL recovery and directory creation.
+    If WAL files are corrupted/stale, checkpoint them before opening.
+    """
+    path = Path(path)
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    wal_path = path.with_suffix(path.suffix + "-wal")
+    shm_path = path.with_suffix(path.suffix + "-shm")
+
+    retry_count = 0
+    max_retries = 3
+    while retry_count < max_retries:
+        try:
+            conn = sqlite3.connect(str(path), timeout=5.0)
+            conn.execute("PRAGMA foreign_keys = ON;")
+
+            try:
+                conn.execute("PRAGMA journal_mode = WAL;")
+                conn.execute("PRAGMA wal_autocheckpoint = 1000;")
+                conn.execute("PRAGMA synchronous = NORMAL;")
+                conn.execute("PRAGMA temp_store = MEMORY;")
+
+                conn.execute("SELECT 1")
+                conn.commit()
+                return conn
+            except sqlite3.OperationalError as e:
+                conn.close()
+                if "database is locked" in str(e) or "disk I/O error" in str(e):
+                    time.sleep(0.5 * (retry_count + 1))
+                    retry_count += 1
+                    continue
+                raise
+        except sqlite3.OperationalError as e:
+            if "unable to open database file" in str(e) and retry_count < max_retries - 1:
+                if wal_path.exists():
+                    try:
+                        wal_path.unlink()
+                    except OSError:
+                        pass
+                if shm_path.exists():
+                    try:
+                        shm_path.unlink()
+                    except OSError:
+                        pass
+                time.sleep(0.5 * (retry_count + 1))
+                retry_count += 1
+                continue
+            raise
+
+    raise RuntimeError(f"Failed to connect to {path} after {max_retries} retries")
 
 
 def init_db(path: Path = DB_PATH) -> None:
@@ -133,7 +182,46 @@ def init_db(path: Path = DB_PATH) -> None:
     Create tables if they don't exist.
     On existing databases, run ALTER TABLE migrations to add new columns
     added in schema updates without dropping existing data.
+    Includes WAL recovery: if init fails due to WAL corruption, recovery is attempted.
     """
+    path = Path(path)
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    wal_path = path.with_suffix(path.suffix + "-wal")
+    shm_path = path.with_suffix(path.suffix + "-shm")
+
+    try:
+        _init_db_impl(path)
+    except sqlite3.OperationalError as e:
+        if "unable to open database file" in str(e):
+            print(f"[DB] Recovering from WAL corruption at {path}...")
+            if wal_path.exists():
+                try:
+                    wal_path.unlink()
+                    print(f"[DB] Removed stale WAL: {wal_path}")
+                except OSError as e:
+                    print(f"[DB] Failed to remove WAL: {e}")
+            if shm_path.exists():
+                try:
+                    shm_path.unlink()
+                    print(f"[DB] Removed stale SHM: {shm_path}")
+                except OSError as e:
+                    print(f"[DB] Failed to remove SHM: {e}")
+
+            time.sleep(0.5)
+            try:
+                _init_db_impl(path)
+                print(f"[DB] Recovery successful")
+            except Exception as e:
+                print(f"[DB] Recovery failed: {e}")
+                raise
+        else:
+            raise
+
+
+def _init_db_impl(path: Path = DB_PATH) -> None:
+    """Internal implementation of database initialization."""
     # Positions new columns
     POSITION_NEW_COLS = [
         ("num_contracts",        "INTEGER NOT NULL DEFAULT 1"),
