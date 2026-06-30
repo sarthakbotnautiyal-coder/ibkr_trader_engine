@@ -59,7 +59,7 @@ mkdir -p /Users/ubexbot/logs
 # no-pidfile check.
 LOCK_FILE="/tmp/ibkr-engine-launch.lock"
 LOCKDIR="/tmp/ibkr-engine-launch.lockdir"
-LOCK_STALE_SECS=300
+LOCK_STALE_SECS=60
 
 # Duplicate-instance backoff (TASK-2026-276)
 STATE_FILE="/tmp/ibkr-engine.last_exit"
@@ -76,22 +76,40 @@ acquire_lock() {
         LOCK_FD=9
         return 0
     fi
+    # PID-liveness stale-detection (TASK-2026-stale-lockdir):
+    # Mirror of the run-ibkr-engine.sh fix. If the lockdir exists, verify
+    # the holder PID (in $LOCKDIR/pid) is alive. A dead PID means the
+    # previous launcher crashed without running its EXIT trap; the
+    # lockdir is stale regardless of mtime, so clean it up and retry.
     if [ -d "$LOCKDIR" ]; then
-        if command -v stat >/dev/null 2>&1; then
-            LOCKDIR_AGE=$(( $(date +%s) - $(stat -f %m "$LOCKDIR" 2>/dev/null || stat -c %Y "$LOCKDIR" 2>/dev/null || echo 0) ))
+        STALE_HOLDER=""
+        if [ -f "$LOCKDIR/pid" ]; then
+            HOLDER_PID=$(cat "$LOCKDIR/pid" 2>/dev/null || echo "")
+            if [ -n "$HOLDER_PID" ] && ! kill -0 "$HOLDER_PID" 2>/dev/null; then
+                STALE_HOLDER="$HOLDER_PID"
+            fi
         else
-            LOCKDIR_AGE=0
+            if command -v stat >/dev/null 2>&1; then
+                LOCKDIR_AGE=$(( $(date +%s) - $(stat -f %m "$LOCKDIR" 2>/dev/null || stat -c %Y "$LOCKDIR" 2>/dev/null || echo 0) ))
+            else
+                LOCKDIR_AGE=0
+            fi
+            if [ "$LOCKDIR_AGE" -gt "$LOCK_STALE_SECS" ]; then
+                STALE_HOLDER="unknown-age-${LOCKDIR_AGE}s"
+            fi
         fi
-        if [ "$LOCKDIR_AGE" -gt "$LOCK_STALE_SECS" ]; then
-            echo "[$(date '+%F %T')] watchdog: removing stale $LOCKDIR (age ${LOCKDIR_AGE}s)" >> "$WATCHDOG_LOG"
-            rmdir "$LOCKDIR" 2>/dev/null || true
+        if [ -n "$STALE_HOLDER" ]; then
+            echo "[$(date '+%F %T')] watchdog: stale lockdir — holder PID $STALE_HOLDER is dead, removing $LOCKDIR" >> "$WATCHDOG_LOG"
+            rm -f "$LOCKDIR/pid" 2>/dev/null || true
+            rmdir "$LOCKDIR" 2>/dev/null || rm -rf "$LOCKDIR" 2>/dev/null || true
         fi
     fi
     if ! mkdir "$LOCKDIR" 2>/dev/null; then
         echo "[$(date '+%F %T')] watchdog: another launch in progress ($LOCKDIR held) — skipping this tick" >> "$WATCHDOG_LOG"
         return 1
     fi
-    trap 'rmdir "$LOCKDIR" 2>/dev/null || true' EXIT
+    echo "$$" > "$LOCKDIR/pid" 2>/dev/null || true
+    trap 'rm -f "$LOCKDIR/pid" 2>/dev/null; rmdir "$LOCKDIR" 2>/dev/null || rm -rf "$LOCKDIR" 2>/dev/null || true' EXIT
     return 0
 }
 

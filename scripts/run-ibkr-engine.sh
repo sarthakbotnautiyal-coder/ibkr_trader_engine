@@ -23,7 +23,13 @@
 #   LOCKDIR    = /tmp/ibkr-engine-launch.lockdir     (POSIX mkdir-atomic fallback)
 #
 # Lock STALENESS:
-#   If the lockdir exists and is older than LOCK_STALE_SECS (300s = 5 min) we
+#   If the lockdir exists we first verify the holder PID (stored in
+#   $LOCKDIR/pid) is alive. A dead holder PID means a previous wrapper
+#   crashed without cleaning up — log it, remove the lockdir, retry.
+#   Only if the PID file is missing do we fall back to age-based
+#   detection (LOCK_STALE_SECS = 60s). 5 min was too long for a crashed
+#   wrapper to be considered stale; 60s is short enough that an
+#   orphaned lockdir does not block the watchdog for a full tick.
 #   treat it as a leftover from a previous SIGKILL'd wrapper and try to clean
 #   it before bailing. Cleanup is best-effort — the worst case is the next
 #   wrapper also fails and the watchdog continues to retry.
@@ -54,7 +60,7 @@ LOG_PATH="$LOG_DIR/$LOG_FILE"
 
 LOCK_FILE="/tmp/ibkr-engine-launch.lock"
 LOCKDIR="/tmp/ibkr-engine-launch.lockdir"
-LOCK_STALE_SECS=300
+LOCK_STALE_SECS=60
 
 # Last-exit sentinel read by ibkr-engine-watchdog.sh (TASK-2026-276).
 EXIT_STATE_FILE="/tmp/ibkr-engine.last_exit"
@@ -78,26 +84,58 @@ acquire_lock() {
         return 0
     fi
     # mkdir-based mutex (POSIX-atomic: mkdir is one syscall, succeeds once).
+    #
+    # PID-liveness stale-detection (TASK-2026-stale-lockdir):
+    # The lockdir holds a pid file ($LOCKDIR/pid) with the WRAPPER's PID
+    # (written immediately after mkdir succeeds, below). If the lockdir
+    # exists when we enter, we verify the recorded PID is still alive
+    # before bailing idempotent. A dead PID means a previous wrapper
+    # crashed (SIGKILL or OOM) without running the EXIT trap — the
+    # lockdir is stale regardless of its mtime, and we remove it and
+    # retry. This fixes the 2026-06-30 incident where a 2-second-old
+    # orphaned lockdir slipped past the 300s mtime check and the
+    # watchdog bailed 5 consecutive times (09:30, 09:35, 09:40, 09:45,
+    # 09:50) without starting the engine.
     if [ -d "$LOCKDIR" ]; then
-        # Stale-detection: if the lockdir is older than LOCK_STALE_SECS, treat
-        # it as a SIGKILL leftover and try to remove it.
-        if command -v stat >/dev/null 2>&1; then
-            LOCKDIR_AGE=$(( $(date +%s) - $(stat -f %m "$LOCKDIR" 2>/dev/null || stat -c %Y "$LOCKDIR" 2>/dev/null || echo 0) ))
+        STALE_HOLDER=""
+        if [ -f "$LOCKDIR/pid" ]; then
+            HOLDER_PID=$(cat "$LOCKDIR/pid" 2>/dev/null || echo "")
+            if [ -n "$HOLDER_PID" ] && ! kill -0 "$HOLDER_PID" 2>/dev/null; then
+                STALE_HOLDER="$HOLDER_PID"
+            fi
         else
-            LOCKDIR_AGE=0
+            # No pid file — fall back to age-based detection.
+            if command -v stat >/dev/null 2>&1; then
+                LOCKDIR_AGE=$(( $(date +%s) - $(stat -f %m "$LOCKDIR" 2>/dev/null || stat -c %Y "$LOCKDIR" 2>/dev/null || echo 0) ))
+            else
+                LOCKDIR_AGE=0
+            fi
+            if [ "$LOCKDIR_AGE" -gt "$LOCK_STALE_SECS" ]; then
+                STALE_HOLDER="unknown-age-${LOCKDIR_AGE}s"
+            fi
         fi
-        if [ "$LOCKDIR_AGE" -gt "$LOCK_STALE_SECS" ]; then
-            echo "[$(date '+%F %T')] run-ibkr-engine.sh: removing stale $LOCKDIR (age ${LOCKDIR_AGE}s)" >> "$LOG_PATH"
-            rmdir "$LOCKDIR" 2>/dev/null || true
+        if [ -n "$STALE_HOLDER" ]; then
+            echo "[$(date '+%F %T')] run-ibkr-engine.sh: stale lockdir — holder PID $STALE_HOLDER is dead, removing $LOCKDIR" >> "$LOG_PATH"
+            # rm -f first so rmdir doesn't fail on a non-empty lockdir.
+            rm -f "$LOCKDIR/pid" 2>/dev/null || true
+            rmdir "$LOCKDIR" 2>/dev/null || rm -rf "$LOCKDIR" 2>/dev/null || true
         fi
     fi
     if ! mkdir "$LOCKDIR" 2>/dev/null; then
+        # Lost the race AFTER cleaning a stale holder — someone else got it
+        # between our rmdir and mkdir. Treat as held; bail idempotent.
         echo "[$(date '+%F %T')] run-ibkr-engine.sh: another invocation holds $LOCKDIR — exiting 0 idempotent" >> "$LOG_PATH"
         return 1
     fi
-    # Best-effort cleanup on graceful exit (SIGNAL won't run the trap — that's
-    # the known SIGKILL limitation; stale-detection above mitigates it).
-    trap 'rmdir "$LOCKDIR" 2>/dev/null || true' EXIT
+    # Record this wrapper's PID inside the lockdir so a future invocation
+    # can verify liveness. $$ is the bash process, which is what actually
+    # holds the mutex (the engine runs as a disowned grandchild).
+    echo "$$" > "$LOCKDIR/pid" 2>/dev/null || true
+    # Best-effort cleanup on graceful exit. SIGNAL won't run the trap —
+    # that's the known SIGKILL limitation; PID-liveness check above
+    # mitigates it. Remove the pid file BEFORE rmdir since rmdir refuses
+    # to remove a non-empty directory.
+    trap 'rm -f "$LOCKDIR/pid" 2>/dev/null; rmdir "$LOCKDIR" 2>/dev/null || rm -rf "$LOCKDIR" 2>/dev/null || true' EXIT
     return 0
 }
 
