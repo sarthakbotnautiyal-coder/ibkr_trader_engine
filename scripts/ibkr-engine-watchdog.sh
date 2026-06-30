@@ -7,19 +7,23 @@
 #       * If process is UP   -> leave it alone
 #   - Outside market hours:
 #       * If process is UP   -> stop it (handles overnight crash recovery)
-#       * If process is DOWN -> leave it alone (cron START will bring it up at 9:30 AM)
+#       * If process is DOWN -> leave it alone (next watchdog tick in market
+#                                  hours will start it; no separate cron
+#                                  START line — single-instruction design,
+#                                  see docs/CRON.md and TASK-2026-268
+#                                  follow-up).
 #
 # Engine manages its own pidfile via run-ibkr-engine.sh / stop-ibkr-engine.sh.
 #
-# Mirrors extractor-watchdog.sh. The 9:30-16:00 ET window matches the crontab
-# schedule (9:30 START, 16:05 STOP), giving the engine 5 minutes of overlap on
-# both ends to flush any open position updates before SIGTERM.
+# Mirrors extractor-watchdog.sh. The 9:30-16:00 ET window matches market hours
+# (engine stops at 16:05 via the STOP cron, giving 5 minutes of overlap to
+# flush any open position updates before SIGTERM).
 #
 # Launch critical section (the call to run-ibkr-engine.sh when the engine is
 # DOWN during market hours) is guarded by the SAME flock-or-lockdir mutex that
-# run-ibkr-engine.sh uses. That way a cron START at 09:35 and a watchdog tick
-# at 09:35 (after the timer stagger lands) are mutually exclusive. See
-# TASK-2026-269 / TASK-2026-274.
+# run-ibkr-engine.sh uses. That way two watchdog ticks fired close together
+# (e.g. on a host wake-from-sleep race) cannot both fork duplicate processes.
+# See TASK-2026-269 / TASK-2026-274.
 #
 # ─────────────────────────────────────────────────────────────────────────────
 # Backoff on duplicate-instance exit (TASK-2026-276)
@@ -50,8 +54,9 @@ ENGINE_REPO="/Users/ubexbot/.openclaw/workspace-venkat/ibkr_trader_engine"
 WATCHDOG_LOG="/Users/ubexbot/logs/ibkr-engine-watchdog.log"
 mkdir -p /Users/ubexbot/logs
 
-# Launch mutex — MUST match run-ibkr-engine.sh so cron START and watchdog tick
-# can't both pass the no-pidfile check.
+# Launch mutex — MUST match run-ibkr-engine.sh so two watchdog ticks (or a
+# watchdog tick concurrent with any future launch path) can't both pass the
+# no-pidfile check.
 LOCK_FILE="/tmp/ibkr-engine-launch.lock"
 LOCKDIR="/tmp/ibkr-engine-launch.lockdir"
 LOCK_STALE_SECS=300
@@ -206,7 +211,7 @@ if [ "$MARKET_STATUS" = "OPEN" ]; then
     release_lock
 else
     # Market closed + process down -> leave alone
-    echo "[$TS] watchdog: ibkr_trader_engine DOWN outside market hours -- leaving (cron will start at 9:35 AM)" >> "$WATCHDOG_LOG"
+    echo "[$TS] watchdog: ibkr_trader_engine DOWN outside market hours -- leaving (next market-hours watchdog tick will start it; single-instruction design per docs/CRON.md)" >> "$WATCHDOG_LOG"
 fi
 
 exit 0

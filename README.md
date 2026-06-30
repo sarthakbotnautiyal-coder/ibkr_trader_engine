@@ -311,12 +311,16 @@ Add to crontab (`crontab -e`):
 */5 * * * * /Users/ubexbot/.openclaw/scripts/ibkr-engine-watchdog.sh
 ```
 
-> **Production cadence (START + STOP + WATCHDOG) is documented in
-> [`docs/CRON.md`](docs/CRON.md).** The simple watchdog-only pattern above
-> works for development, but production uses a market-aware START at 09:35 ET
-> (staggered off `:30` to avoid colliding with the `*/5` watchdog tick ---
-> see TASK-2026-268) plus a STOP at 16:05 ET. The crontab itself lives on the
-> host, not in this repo.
+> **Production cadence (WATCHDOG + STOP, single-instruction design) is
+> documented in [`docs/CRON.md`](docs/CRON.md).** The simple watchdog-only
+> pattern above works for development. Production uses the same single
+> watchdog (`*/5 * * * *`) which handles **both** cold-start at market open
+> and post-crash recovery, plus a market-aware STOP at 16:05 ET. There is no
+> separate START line — the watchdog fires within 5 minutes of market open
+> and starts the engine. This is structurally race-free: only one cron
+> instruction can ever start the engine. See TASK-2026-268 (PR #14 stagger
+> attempt) and its follow-up PR which removed the redundant START line
+> entirely. The crontab itself lives on the host, not in this repo.
 
 ---
 
