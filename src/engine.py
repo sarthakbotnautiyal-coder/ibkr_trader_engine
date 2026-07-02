@@ -1451,6 +1451,7 @@ class AutoTraderEngine:
                 side=pos.side.value,
                 short_strike=pos.short_strike,
                 long_strike=pos.long_strike,
+                quantity=pos.num_contracts,
             )
 
             if result.status == "dry_run":
