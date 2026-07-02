@@ -69,6 +69,19 @@ _LOGS_DIR = _SRC_DIR / CONFIG["paths"]["logs"]
 def _log(name: str = __name__) -> logging.Logger:
     return get_engine_logger(name, _LOGS_DIR)
 
+def _fmt(value, spec='.2f', fallback='n/a') -> str:
+    """Format a possibly-None numeric value safely.
+
+    Used by structured log helpers (e.g. _log_tick_heartbeat) when an upstream
+    feed (EM, RSI, GEX, SPX) may legitimately be None during warmup or
+    transient scanner outages. Returns fallback (default 'n/a') instead
+    of raising TypeError: unsupported format string passed to NoneType.__format__.
+
+    Backward-compat: non-None values format exactly as before
+    (e.g. _fmt(14.32) -> '14.32').
+    """
+    return format(value, spec) if value is not None else fallback
+
 # ---------------------------------------------------------------------------
 # Engine
 # ---------------------------------------------------------------------------
@@ -903,16 +916,20 @@ class AutoTraderEngine:
     def _log_tick_heartbeat(
         self,
         ts: str,
-        spx: float,
-        em: float,
-        gex_val: float,
+        spx: Optional[float],
+        em: Optional[float],
+        gex_val: Optional[float],
         regime: str,
-        rsi: float,
+        rsi: Optional[float],
         gex_regime: str,
     ):
+        # TASK-2026-308: defensive formatting — spx/em/gex_val/rsi may be
+        # None at warmup or during scanner outages. _fmt() returns 'n/a'
+        # instead of raising NoneType.__format__.
         self.logger.info(
-            f"{ts} ET [TICK] SPX={spx:.2f} | EM={em:.2f} | "
-            f"GEX={gex_val:.0f} | regime={regime} | RSI={rsi:.1f} | GEX_regime={gex_regime}"
+            f"{ts} ET [TICK] SPX={_fmt(spx)} | EM={_fmt(em)} | "
+            f"GEX={_fmt(gex_val, '.0f')} | regime={regime} | "
+            f"RSI={_fmt(rsi, '.1f')} | GEX_regime={gex_regime}"
         )
 
     def _log_skip_if_changed(self, ts: str, side: str, decision):
@@ -1543,11 +1560,11 @@ class AutoTraderEngine:
     def _on_heartbeat(
         self,
         ts: str,
-        spx: float,
-        em: float,
-        gex_val: float,
+        spx: Optional[float],
+        em: Optional[float],
+        gex_val: Optional[float],
         regime: str,
-        rsi: float,
+        rsi: Optional[float],
         gex_regime: str,
     ) -> None:
         self._log_tick_heartbeat(ts, spx, em, gex_val, regime, rsi, gex_regime)
