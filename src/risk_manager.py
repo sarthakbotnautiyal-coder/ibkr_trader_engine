@@ -10,17 +10,13 @@ Both conditions must pass for entry.
 VIX-Adaptive Entry Parameters (TASK-2026-191):
   Entry param set (min_premium, rsi thresholds, distance multiples) is selected
   based on live VIX level. Each VIX bucket maps to a different parameter profile
-  defined in config/config.yaml under entry.vix_buckets.
-
-  VIX < 13  → NO TRADE
-  VIX 13-16 → bucket "13-16"
-  VIX 16-20 → bucket "16-20"
-  VIX 20-25 → bucket "20-25"
-  VIX 25-30 → bucket "25-30"
-  VIX > 30  → NO TRADE
+  defined in config/config.yaml under entry.vix_buckets. Bucket boundaries are
+  derived solely from the config keys ("13-16", "16-20", ...) — adding or
+  re-ranging buckets is a config-only change (see src/vix_buckets.py).
 
   If combined.vix is unavailable, fall back to expected_move * 16.
-  VIX outside all buckets → skip entry entirely (no trade).
+  VIX outside all buckets (below the lowest or above the highest) → skip
+  entry entirely (no trade).
 
 RSI Gate (TASK-2026-146):
   Each tick, RSI is read from CombinedSnapshot. If RSI > rsi_gate_threshold,
@@ -53,6 +49,8 @@ from zoneinfo import ZoneInfo
 from typing import Optional
 
 from config import CONFIG
+
+import vix_buckets
 
 
 # ---------------------------------------------------------------------------
@@ -121,31 +119,17 @@ def is_force_close_time() -> bool:
 # VIX-adaptive helpers
 # ---------------------------------------------------------------------------
 
-VIX_BUCKET_BOUNDARIES = [
-    (13.0, 16.0, "13-16"),   # [13, 16)
-    (16.0, 20.0, "16-20"),   # [16, 20)
-    (20.0, 25.0, "20-25"),   # [20, 25)
-    (25.0, 30.0, "25-30"),   # [25, 30]  inclusive
-]
-
-
 def _get_vix_bucket(vix: float) -> Optional[str]:
     """
-    Map a VIX value to a bucket name string.
+    Map a VIX value to a bucket name string. Boundaries are derived from
+    config.yaml entry.vix_buckets keys (see src/vix_buckets.py).
 
     Returns:
       bucket name  — VIX falls in a bucket
-      None         — VIX < 13 or VIX > 30 (skip entry entirely)
+      None         — VIX outside all buckets (skip entry entirely)
     """
-    for lo, hi, name in VIX_BUCKET_BOUNDARIES:
-        if name == "25-30":
-            # Inclusive on both ends for the top bucket
-            if lo <= vix <= hi:
-                return name
-        else:
-            if lo <= vix < hi:
-                return name
-    return None
+    bucket = vix_buckets.classify(vix)
+    return bucket.name if bucket is not None else None
 
 
 def _get_vix_effective(combined) -> float:

@@ -24,8 +24,8 @@ TASK-2026-070: USE_MARGIN_LIMIT flag in config.yaml.
 TASK-2026-XXX: VIX-bucket RSI gate lookup.
   - RSI gates are now looked up per-VIX-bucket from CONFIG["entry"]["vix_buckets"]
   - tick_processor._get_rsi_gates(vix) maps VIX → (rsi_upper, rsi_lower)
-  - Bucket mapping: 13-16, 16-20, 20-25, 25-30
-  - VIX < 13 or VIX > 30 → no-trade zone (widest gate defaults, caller enforces)
+  - Bucket boundaries derived from config keys (see src/vix_buckets.py)
+  - VIX outside all buckets → no-trade zone (widest gate defaults, caller enforces)
 """
 import logging
 import time
@@ -42,6 +42,7 @@ if str(_SELF_DIR) not in sys.path:
 from config import CONFIG
 from log_setup import get_engine_logger
 from tick_processor import TickProcessor, _get_rsi_gates
+import vix_buckets
 from telegram_notifier import (
     notify_entry, notify_exit,
     notify_rejection, notify_timeout,
@@ -1916,7 +1917,12 @@ class AutoTraderEngine:
                          f"{CONFIG['market']['entry_end']} ET")
         self.logger.info(f"RSI Gate ENABLED (VIX-adaptive per bucket): upper={rsi_upper} lower={rsi_lower} | "
                          f"RSI>{rsi_upper}→CALL, RSI<{rsi_lower}→PUT, in-band→skip")
-        self.logger.info(f"VIX buckets: 13-16→55/54, 16-20→60/40, 20-25→70/30, 25-30→75/25")
+        _buckets_summary = ", ".join(
+            f"{b.name}→{b.params.get('rsi_upper_threshold', 70.0):g}/"
+            f"{b.params.get('rsi_lower_threshold', 30.0):g}"
+            for b in vix_buckets.get_buckets()
+        ) or "(none configured — all entries blocked)"
+        self.logger.info(f"VIX buckets (config-driven): {_buckets_summary}")
         _dg_cfg = CONFIG.get("day_gate", {})
         self.logger.info(
             f"Day Gate: enabled={_dg_cfg.get('enabled', True)} | "
