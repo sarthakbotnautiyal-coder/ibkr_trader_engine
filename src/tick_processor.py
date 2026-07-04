@@ -38,10 +38,10 @@ from typing import Callable, Optional, Protocol
 
 
 # ---------------------------------------------------------------------------
-# Config (module-level — used in process_tick)
+# VIX bucket resolution (buckets defined solely in config.yaml)
 # ---------------------------------------------------------------------------
 
-from config import CONFIG
+import vix_buckets
 
 
 # ---------------------------------------------------------------------------
@@ -52,36 +52,22 @@ def _get_rsi_gates(vix: Optional[float]) -> tuple[float, float]:
     """
     Return (rsi_upper, rsi_lower) looked up from the VIX bucket in config.
 
-    Bucket mapping (config.yaml entry.vix_buckets):
-      VIX 13-16 → "13-16"
-      VIX 16-20 → "16-20"
-      VIX 20-25 → "20-25"
-      VIX 25-30 → "25-30"
-
-    VIX < 13 or VIX > 30 → NO TRADE bucket (return wide defaults so no
-    side passes the gate; caller must also check the no-trade guard).
-    Falls back to 70/30 if bucket is somehow missing.
+    Buckets come solely from config.yaml entry.vix_buckets (boundary
+    semantics in src/vix_buckets.py). VIX outside all buckets is the
+    no-trade zone: use the top bucket's gates — most restrictive — so no
+    side passes; caller must also check the no-trade guard.
+    Falls back to 70/30 if vix is None or no buckets are configured.
     """
     if vix is None:
         return (70.0, 30.0)
 
-    if 13 <= vix < 16:
-        bucket = "13-16"
-    elif 16 <= vix < 20:
-        bucket = "16-20"
-    elif 20 <= vix < 25:
-        bucket = "20-25"
-    elif 25 <= vix <= 30:
-        bucket = "25-30"
-    else:
-        # VIX < 13 or VIX > 30 — no-trade zone; use widest band
-        bucket = "25-30"  # most restrictive (highest upper, lowest lower)
+    buckets = vix_buckets.get_buckets()
+    if not buckets:
+        return (70.0, 30.0)
 
-    entry_cfg = CONFIG.get("entry", {})
-    buckets = entry_cfg.get("vix_buckets", {})
-    bucket_cfg = buckets.get(bucket, {})
-    upper = bucket_cfg.get("rsi_upper_threshold", 70.0)
-    lower = bucket_cfg.get("rsi_lower_threshold", 30.0)
+    bucket = vix_buckets.classify(vix, buckets) or buckets[-1]
+    upper = bucket.params.get("rsi_upper_threshold", 70.0)
+    lower = bucket.params.get("rsi_lower_threshold", 30.0)
     return (upper, lower)
 
 
