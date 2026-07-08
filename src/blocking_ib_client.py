@@ -702,11 +702,6 @@ class BlockingIBKRClient:
             return []
         return self._enqueue(_get_positions_impl, timeout=10.0)
 
-    def reconcile(self, store) -> None:
-        if DRY_RUN:
-            return
-        self._enqueue(_reconcile_impl, store, timeout=20.0)
-
     # -------------------------------------------------------------------------
     # TASK-2026-179: Polling methods (primary sync mechanism — no callbacks)
     # -------------------------------------------------------------------------
@@ -1144,28 +1139,6 @@ def _get_margin_limit_impl(ib: IB) -> float:
 
 def _get_positions_impl(ib: IB) -> List:
     return ib.reqPositions()
-
-
-def _reconcile_impl(ib: IB, store) -> None:
-    """Compare IBKR positions against positions.db. Runs in IB thread."""
-    ibkr_raw = ib.reqPositions()
-
-    ibkr_map: Dict[tuple, int] = {}
-    for pos in ibkr_raw:
-        c = pos.contract
-        if c.symbol != "SPX":
-            continue
-        key = (c.symbol, c.right, c.strike)
-        ibkr_map[key] = pos.position
-
-    for db_pos in store.get_open():
-        key = ("SPX", db_pos.side.value, db_pos.short_strike)
-        if key not in ibkr_map:
-            store.close_position(
-                db_pos.db_id,
-                status="closed_manual",
-                notes="Closed manually in TWS, detected on reconciliation",
-            )
 
 
 # TASK-2026-179: Polling-only methods

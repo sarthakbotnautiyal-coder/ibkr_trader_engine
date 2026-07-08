@@ -666,11 +666,22 @@ class AutoTraderEngine:
         self._pending_entry_times.pop(order_id, None)
 
         # Update DB: pending_open → open, record fill info
-        from trades_db import get_conn, update_position_status, update_position_fill, mark_signal_filled
+        from trades_db import (
+            get_conn, update_position_status, update_position_fill,
+            update_position_num_contracts, mark_signal_filled,
+        )
+
+        # Sync point #2: reflect the actual filled lot count (IBKR is the source
+        # of truth). The pending_open row was written with the requested
+        # contracts_per_trade; a partial fill means fewer contracts are really
+        # open, so persist what IBKR actually filled.
+        filled_qty = int(filled) if filled else (pos.num_contracts or 1)
 
         fill_ts = self._now().isoformat(timespec="seconds")
         with get_conn() as conn:
             update_position_fill(conn, db_id, fill_price=avg_price, fill_time=fill_ts)
+            if filled_qty != (pos.num_contracts or 1):
+                update_position_num_contracts(conn, db_id, filled_qty)
             update_position_status(conn, db_id, status="open")
             conn.commit()
 
@@ -696,10 +707,11 @@ class AutoTraderEngine:
                     f"long_strike={pos.long_strike:.0f}"
                 )
 
-        # Update in-memory position status
+        # Update in-memory position status (and lot count if it changed)
         for p in self.store._positions:
             if p.db_id == db_id:
                 p.status = "open"
+                p.num_contracts = filled_qty
                 break
 
         self.logger.info(
@@ -874,9 +886,11 @@ class AutoTraderEngine:
             f"Position may have been closed manually in TWS"
         )
 
-        # Reconcile with IBKR to find if position is actually closed
+        # Sync point #3 (exit path): a rejected/inactive close often means the
+        # position was already closed in TWS or expired — reconcile against IBKR
+        # (source of truth) so the DB reflects reality.
         try:
-            self.client.reconcile(self.store)
+            self._sync_positions_with_ibkr("close_rejected")
         except Exception as e:
             self.logger.warning(f"Reconcile failed after close rejection: {e}")
 
@@ -1406,21 +1420,49 @@ class AutoTraderEngine:
             )
             return
 
-        # Validate position still exists in IBKR before sending exit order
+        # Validate against IBKR (source of truth) before sending the exit order,
+        # and clamp the close quantity to what IBKR actually holds — so we close
+        # exactly the number of contracts that are open (not more, not less),
+        # even if a partial manual close happened since the last reconcile.
         if not self.dry_run and self.client:
+            from position_store import PositionSide
             ibkr_positions = self.client.get_open_positions_ibkr()
-            position_exists_in_ibkr = any(
-                p.contract.strike == pos.short_strike
-                and p.position != 0
-                for p in ibkr_positions
-                if hasattr(p, 'contract') and hasattr(p, 'position')
-            )
-            if not position_exists_in_ibkr:
+            right = "C" if pos.side == PositionSide.CALL else "P"
+            held_qty = 0
+            for p in ibkr_positions:
+                c = getattr(p, "contract", None)
+                qty = getattr(p, "position", 0)
+                if c is None or not qty:
+                    continue
+                if getattr(c, "symbol", None) != "SPX":
+                    continue
+                if getattr(c, "right", None) != right:
+                    continue
+                if float(getattr(c, "strike", 0)) == float(pos.short_strike):
+                    held_qty = abs(int(qty))
+                    break
+
+            if held_qty == 0:
                 self.logger.warning(
                     f"{ts} ET [EXIT SKIP] pos_id={pos.db_id} | "
                     f"position not found in IBKR portfolio — may be already closed"
                 )
                 return
+
+            # Clamp DB/in-memory lot count to IBKR's actual holding so the close
+            # order and the resulting exit notification use the true quantity.
+            if held_qty != (pos.num_contracts or 1):
+                from trades_db import get_conn, update_position_num_contracts
+                self.logger.warning(
+                    f"{ts} ET [EXIT QTY SYNC] pos_id={pos.db_id} | "
+                    f"{pos.side.value} {pos.short_strike:.0f}/{pos.long_strike:.0f} | "
+                    f"num_contracts {pos.num_contracts} → {held_qty} (IBKR-held) "
+                    f"before close"
+                )
+                with get_conn(self.store.db_path) as conn:
+                    update_position_num_contracts(conn, pos.db_id, held_qty)
+                    conn.commit()
+                pos.num_contracts = held_qty
 
         if decision.should_exit:
             pnl = 0.0
@@ -1569,6 +1611,268 @@ class AutoTraderEngine:
         gex_regime: str,
     ) -> None:
         self._log_tick_heartbeat(ts, spx, em, gex_val, regime, rsi, gex_regime)
+
+    # -------------------------------------------------------------------------
+    # IBKR ⇄ positions.db reconciliation — IBKR is the source of truth
+    # -------------------------------------------------------------------------
+
+    def _sync_positions_with_ibkr(self, reason: str) -> None:
+        """
+        Reconcile positions.db against IBKR's actual holdings. IBKR is authoritative.
+
+        Called at the three sync points: engine start, and (via the close-rejection
+        path) when a close order comes back rejected/inactive. On-fill quantity sync
+        is handled directly in _on_fill_confirmed.
+
+        Reconciliation rules:
+          - DB 'open' row whose short leg is GONE in IBKR → booked 'expired'
+            (full-credit profit — same accounting as the EOD expiry sweep).
+          - DB 'open' row whose IBKR lot count differs → num_contracts updated to
+            match IBKR.
+          - IBKR leg(s) with no matching DB row → auto-created as a new 'open' row
+            (spread geometry inferred from the configured spread widths).
+
+        DB structure note: positions.db stores SPREADS (short+long combo) with a
+        num_contracts lot count. IBKR reqPositions() returns INDIVIDUAL legs — a
+        5-lot spread is a short leg (position=-5) and a long leg (position=+5),
+        with right 'C'/'P' (DB stores 'CALL'/'PUT'). We rebuild spread↔leg mapping
+        here using the fixed geometry: PUT long = short-width, CALL long = short+width.
+
+        Never raises — a reconcile failure must not crash the tick/run loop.
+        """
+        if self.dry_run:
+            return
+        if not self.client or not self.client.is_connected():
+            self.logger.info(f"[RECONCILE:{reason}] skipped — IBKR not connected")
+            return
+
+        try:
+            from executor import today_expiry
+            from position_store import TradePosition, PositionSide
+            from telegram_notifier import send_telegram_message
+            from trades_db import get_conn, insert_signal, update_position_num_contracts
+
+            today = today_expiry()
+            ibkr_positions = self.client.get_open_positions_ibkr()
+
+            # Build a mutable leg map: (right, strike) -> signed net qty.
+            # Only today's-expiry SPX options; skip zero-qty legs. A prior-day
+            # 0DTE that already expired simply won't be present here, which is
+            # exactly what drives the "expired — not in IBKR" branch below.
+            leg_map: dict[tuple[str, float], int] = {}
+            for p in ibkr_positions:
+                c = getattr(p, "contract", None)
+                qty = getattr(p, "position", 0)
+                if c is None or not qty:
+                    continue
+                if getattr(c, "symbol", None) != "SPX":
+                    continue
+                right = getattr(c, "right", None)
+                if right not in ("C", "P"):
+                    continue
+                expiry = getattr(c, "lastTradeDateOrContractMonth", None)
+                if expiry and expiry != today:
+                    continue
+                key = (right, float(c.strike))
+                leg_map[key] = leg_map.get(key, 0) + int(qty)
+
+            self.logger.info(
+                f"[RECONCILE:{reason}] IBKR SPX legs (exp {today}): "
+                f"{ {f'{r}{s:.0f}': q for (r, s), q in leg_map.items()} }"
+            )
+
+            now_ts = self._now().isoformat(timespec="seconds")
+
+            # ---- Pass 1: reconcile existing DB 'open' positions ----
+            with get_conn(self.store.db_path) as conn:
+                for pos in list(self.store.get_open()):
+                    right = "C" if pos.side == PositionSide.CALL else "P"
+                    short_key = (right, float(pos.short_strike))
+                    short_signed = leg_map.get(short_key, 0)
+                    short_qty = abs(short_signed)
+
+                    if short_qty == 0:
+                        # Missing in IBKR → book as expired worthless (full credit).
+                        pnl = round((pos.credit or 0) * 100 * (pos.num_contracts or 1), 2)
+                        conn.execute(
+                            """
+                            UPDATE positions
+                            SET status = 'expired',
+                                close_time = ?,
+                                debit = 0.0,
+                                pnl = ?,
+                                max_profit = COALESCE(max_profit, ?),
+                                exit_layer = 0,
+                                exit_conditions_met = 1,
+                                exit_regime = 'expired',
+                                notes = COALESCE(notes || ' | ', '') ||
+                                        'expired — not in IBKR (reconcile)'
+                            WHERE id = ?
+                            """,
+                            (now_ts, pnl, pnl, pos.db_id),
+                        )
+                        insert_signal(
+                            conn,
+                            timestamp=now_ts,
+                            layer=pos.layer or 0,
+                            spx_spot=0.0,
+                            signalled=1,
+                            signal_reason="reconcile_expiry",
+                            premium_passed=1,
+                            distance_passed=1,
+                            collision_passed=1,
+                            filled=1,
+                            short_strike=pos.short_strike,
+                            long_strike=pos.long_strike,
+                            credit=pos.credit,
+                            action="EXPIRE",
+                            task_id=self._TASK_ID,
+                        )
+                        self.logger.warning(
+                            f"[RECONCILE:{reason}] pos_id={pos.db_id} "
+                            f"{pos.side.value} {pos.short_strike:.0f}/{pos.long_strike:.0f} "
+                            f"not in IBKR → status=expired pnl=${pnl:.2f}"
+                        )
+                        send_telegram_message(
+                            f"♻️ Reconcile ({reason}): "
+                            f"{pos.side.value} {pos.short_strike:.0f}/{pos.long_strike:.0f} "
+                            f"gone from IBKR → booked EXPIRED (P&L ${pnl:.2f})"
+                        )
+                        continue
+
+                    if short_qty != (pos.num_contracts or 1):
+                        update_position_num_contracts(conn, pos.db_id, short_qty)
+                        old = pos.num_contracts
+                        pos.num_contracts = short_qty
+                        self.logger.warning(
+                            f"[RECONCILE:{reason}] pos_id={pos.db_id} "
+                            f"{pos.side.value} {pos.short_strike:.0f}/{pos.long_strike:.0f} "
+                            f"num_contracts {old} → {short_qty} (IBKR)"
+                        )
+                        send_telegram_message(
+                            f"♻️ Reconcile ({reason}): "
+                            f"{pos.side.value} {pos.short_strike:.0f}/{pos.long_strike:.0f} "
+                            f"contracts {old} → {short_qty} to match IBKR"
+                        )
+
+                    # Consume this spread's legs so they aren't seen as orphans.
+                    self._consume_leg(leg_map, short_key, short_qty)
+                    long_key = (right, float(pos.long_strike)) if pos.long_strike is not None else None
+                    if long_key is not None:
+                        self._consume_leg(leg_map, long_key, short_qty)
+
+                conn.commit()
+
+            # ---- Pass 2: auto-create orphan positions (IBKR legs, no DB row) ----
+            self._reconcile_orphans(leg_map, reason)
+
+            # Resync in-memory state from DB.
+            self.store.load_open()
+
+        except Exception as exc:
+            self.logger.error(
+                f"[RECONCILE:{reason}] failed: {exc}", exc_info=True
+            )
+
+    @staticmethod
+    def _consume_leg(leg_map: dict, key: tuple, qty: int) -> None:
+        """Decrement a leg's magnitude toward zero; drop it when fully consumed."""
+        signed = leg_map.get(key)
+        if signed is None:
+            return
+        sign = 1 if signed > 0 else -1
+        remaining = abs(signed) - qty
+        if remaining <= 0:
+            leg_map.pop(key, None)
+        else:
+            leg_map[key] = sign * remaining
+
+    def _reconcile_orphans(self, leg_map: dict, reason: str) -> None:
+        """
+        Auto-create DB rows for IBKR legs that no open DB position claimed.
+
+        Pairs each short leg (qty<0) with a long leg (qty>0) on the same right
+        using the fixed spread geometry (PUT: long = short-width; CALL: long =
+        short+width) for the configured widths. Unpairable legs are logged only.
+        """
+        if not leg_map:
+            return
+
+        from position_store import TradePosition, PositionSide
+        from telegram_notifier import send_telegram_message
+
+        widths = [
+            CONFIG["entry"].get("spread_width_primary", 10),
+            CONFIG["entry"].get("spread_width_fallback", 20),
+        ]
+
+        for right in ("C", "P"):
+            shorts = sorted(s for (r, s), q in leg_map.items() if r == right and q < 0)
+            for short_strike in shorts:
+                short_key = (right, short_strike)
+                short_signed = leg_map.get(short_key, 0)
+                if short_signed >= 0:
+                    continue  # already consumed by an earlier pairing
+                short_qty = abs(short_signed)
+
+                # Find the long leg by the fixed geometry.
+                long_strike = None
+                for w in widths:
+                    cand = short_strike + w if right == "C" else short_strike - w
+                    if leg_map.get((right, cand), 0) > 0:
+                        long_strike = cand
+                        break
+
+                if long_strike is None:
+                    self.logger.warning(
+                        f"[RECONCILE:{reason}] ORPHAN unpaired {right} short "
+                        f"{short_strike:.0f} x{short_qty} — no matching long leg "
+                        f"at ±{widths}; leaving for manual review (no DB write)"
+                    )
+                    continue
+
+                long_key = (right, long_strike)
+                lots = min(short_qty, abs(leg_map.get(long_key, 0)))
+                if lots <= 0:
+                    continue
+
+                side = PositionSide.CALL if right == "C" else PositionSide.PUT
+                pos = TradePosition(
+                    task_id=f"reconcile-{reason}",
+                    ticker="SPX",
+                    side=side,
+                    short_strike=short_strike,
+                    long_strike=long_strike,
+                    credit=0.0,
+                    num_contracts=lots,
+                    notes="auto-created from IBKR reconcile (credit unknown)",
+                )
+                try:
+                    db_id = self.store.add_position(
+                        pos,
+                        status="open",
+                        combined=self._current_combined,
+                    )
+                    self.logger.warning(
+                        f"[RECONCILE:{reason}] ORPHAN auto-created pos_id={db_id} "
+                        f"{side.value} {short_strike:.0f}/{long_strike:.0f} x{lots} "
+                        f"(credit unknown → 0.0)"
+                    )
+                    send_telegram_message(
+                        f"♻️ Reconcile ({reason}): auto-created "
+                        f"{side.value} {short_strike:.0f}/{long_strike:.0f} x{lots} "
+                        f"from IBKR (no DB row; credit unknown)"
+                    )
+                except Exception as exc:
+                    self.logger.error(
+                        f"[RECONCILE:{reason}] failed to auto-create "
+                        f"{side.value} {short_strike:.0f}/{long_strike:.0f}: {exc}"
+                    )
+                    continue
+
+                # Consume the paired legs.
+                self._consume_leg(leg_map, short_key, lots)
+                self._consume_leg(leg_map, long_key, lots)
 
     # -------------------------------------------------------------------------
     # EOD expiry sweep — closes positions that expired at 4 PM ET
@@ -1946,6 +2250,11 @@ class AutoTraderEngine:
                 while not self.client.is_connected():
                     self.logger.info("Waiting for IBKR connection...")
                     time.sleep(2)
+                # Sync point #1: reconcile positions.db against IBKR at startup,
+                # once connected. IBKR is the source of truth — this corrects any
+                # drift accrued while the engine was offline (fills, manual TWS
+                # closes, expiries).
+                self._sync_positions_with_ibkr("startup")
             # TASK-2026-235: outer loop resilient to transient failures (e.g. WAL contention).
             # KeyboardInterrupt is re-raised so SIGTERM/Ctrl+C still hits the outer except below.
             while True:

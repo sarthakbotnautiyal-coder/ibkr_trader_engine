@@ -541,6 +541,32 @@ def update_position_fill(
     )
 
 
+def update_position_num_contracts(
+    conn: sqlite3.Connection,
+    pos_id: int,
+    num_contracts: int,
+) -> None:
+    """
+    Set a position's contract count to match IBKR (the source of truth).
+
+    Used by the engine's IBKR reconciliation (_sync_positions_with_ibkr) and on
+    fill confirmation, when the actual filled/held quantity differs from what the
+    pending row assumed (e.g. a partial fill, or a manual TWS partial close).
+
+    Keeps ``total_credit`` consistent with the new lot count
+    (``credit * 100 * num_contracts``) so downstream P&L math stays correct.
+    """
+    conn.execute(
+        """
+        UPDATE positions
+        SET num_contracts = ?,
+            total_credit  = credit * 100 * ?
+        WHERE id = ?
+        """,
+        (num_contracts, num_contracts, pos_id),
+    )
+
+
 def update_position_order_id(
     conn: sqlite3.Connection,
     pos_id: int,
