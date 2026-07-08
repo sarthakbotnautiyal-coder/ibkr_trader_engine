@@ -392,6 +392,7 @@ def _row_to_position(row: tuple) -> Position:
         status=g("status"), pnl=g("pnl"),
         max_profit=g("max_profit"), max_loss=g("max_loss"),
         layer=g("layer"), notes=g("notes"),
+        num_contracts=g("num_contracts", 1),
 
         # Entry snapshot
         entry_spx_spot=g("entry_spx_spot"),

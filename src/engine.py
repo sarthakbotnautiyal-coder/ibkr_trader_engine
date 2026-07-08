@@ -1683,6 +1683,21 @@ class AutoTraderEngine:
 
             now_ts = self._now().isoformat(timespec="seconds")
 
+            # ---- Pass 0: claim legs of in-flight (pending_open) orders ----
+            # A pending_open row is a real order that may already be filled at
+            # IBKR; its confirmation/rollback is owned by the pending-order
+            # poller, not this reconcile. Consume its legs so they are NOT
+            # mistaken for orphans and duplicated as a new 'open' row.
+            for pos in self.store._positions:
+                if pos.status != "pending_open":
+                    continue
+                right = "C" if pos.side == PositionSide.CALL else "P"
+                short_key = (right, float(pos.short_strike))
+                self._consume_leg(leg_map, short_key, abs(leg_map.get(short_key, 0)))
+                if pos.long_strike is not None:
+                    long_key = (right, float(pos.long_strike))
+                    self._consume_leg(leg_map, long_key, abs(leg_map.get(long_key, 0)))
+
             # ---- Pass 1: reconcile existing DB 'open' positions ----
             with get_conn(self.store.db_path) as conn:
                 for pos in list(self.store.get_open()):

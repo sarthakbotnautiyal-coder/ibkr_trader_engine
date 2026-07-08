@@ -97,18 +97,18 @@ def _make_engine(tmp_path: Path, ibkr_legs, dry_run: bool = False):
 
 
 def _add_open(eng, cfg, side: str, short: float, long: float,
-              credit: float, num_contracts: int) -> int:
-    """Insert a confirmed 'open' spread into the store's DB."""
+              credit: float, num_contracts: int, status: str = "open") -> int:
+    """Insert a spread into the store's DB (status 'open' or 'pending_open')."""
     from position_store import TradePosition, PositionSide
     with patch("position_store.CONFIG", cfg), \
          patch("position_store.build_market_snapshot",
                return_value=_empty_snap()):
         pos = TradePosition(
-            task_id=f"T-{short}", ticker="SPX",
+            task_id=f"T-{short}-{status}", ticker="SPX",
             side=PositionSide(side), short_strike=short, long_strike=long,
             credit=credit, num_contracts=num_contracts,
         )
-        return eng.store.add_position(pos, status="open")
+        return eng.store.add_position(pos, status=status)
 
 
 def _empty_snap():
@@ -276,6 +276,70 @@ def test_exit_clamps_close_qty_to_ibkr_held(tmp_path):
     assert _row(db, pid, cols="num_contracts")[0] == 3
     # Tracked as a pending exit awaiting fill confirmation.
     assert 999 in eng._pending_exits
+
+
+def test_row_to_position_loads_num_contracts(tmp_path):
+    """
+    Regression: _row_to_position() must read num_contracts from the DB, not
+    silently default it to 1. A 5-lot position stored in the DB must load as 5.
+    """
+    from trades_db import init_db, insert_position, get_open_positions, Position
+
+    db = tmp_path / "p.db"
+    with get_conn(db) as conn:
+        init_db(db)
+        insert_position(conn, Position(
+            task_id="T", ticker="SPX", side="PUT",
+            short_strike=7355.0, long_strike=7335.0,
+            open_time="2026-07-08T10:00:00-04:00", credit=0.31,
+            num_contracts=5, status="open",
+        ))
+        conn.commit()
+        loaded = get_open_positions(conn)
+
+    assert len(loaded) == 1
+    assert loaded[0].num_contracts == 5
+
+
+def test_load_open_preserves_num_contracts(tmp_path):
+    """
+    Regression: PositionStore.load_open() must carry num_contracts through to
+    the in-memory TradePosition (was defaulting to 1 on every restart).
+    """
+    legs = []
+    eng, db, cfg = _make_engine(tmp_path, legs)
+    _add_open(eng, cfg, "PUT", 7355, 7335, credit=0.31, num_contracts=5)
+
+    eng.store.load_open()  # simulate restart reload
+
+    pos = eng.store.get_open()[0]
+    assert pos.num_contracts == 5
+
+
+def test_pending_open_not_duplicated_as_orphan(tmp_path):
+    """
+    Regression: a pending_open order whose legs are already at IBKR must NOT be
+    auto-created as a duplicate 'open' orphan — its fill is owned by the poller.
+    """
+    # One confirmed open spread + one pending_open spread, both present at IBKR.
+    legs = [
+        _leg("P", 7355, -5), _leg("P", 7335, +5),   # open 7355/7335
+        _leg("P", 7345, -5), _leg("P", 7325, +5),   # pending_open 7345/7325
+    ]
+    eng, db, cfg = _make_engine(tmp_path, legs)
+    _add_open(eng, cfg, "PUT", 7355, 7335, credit=0.31, num_contracts=5)
+    _add_open(eng, cfg, "PUT", 7345, 7325, credit=0.27, num_contracts=5,
+              status="pending_open")
+
+    _run_sync(eng, cfg)
+
+    with get_conn(db) as conn:
+        rows = conn.execute(
+            "SELECT short_strike, status FROM positions "
+            "WHERE short_strike = 7345 ORDER BY id"
+        ).fetchall()
+    # Exactly one 7345 row, still pending_open — no duplicate orphan.
+    assert rows == [(pytest.approx(7345), "pending_open")]
 
 
 def test_dry_run_is_noop(tmp_path):
