@@ -57,8 +57,8 @@ mkdir -p /Users/ubexbot/logs
 # Launch mutex — MUST match run-ibkr-engine.sh so two watchdog ticks (or a
 # watchdog tick concurrent with any future launch path) can't both pass the
 # no-pidfile check.
-LOCK_FILE="/tmp/ibkr-engine-launch.lock"
-LOCKDIR="/tmp/ibkr-engine-launch.lockdir"
+LOCK_FILE="/tmp/ibkr-engine-watchdog.lock"
+LOCKDIR="/tmp/ibkr-engine-watchdog.lockdir"
 LOCK_STALE_SECS=60
 
 # Duplicate-instance backoff (TASK-2026-276)

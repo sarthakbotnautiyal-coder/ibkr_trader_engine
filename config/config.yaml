@@ -30,24 +30,31 @@ entry:
   spread_width_primary: 10
   spread_width_fallback: 20
   short_delta_target: 0.03
-  contracts_per_trade: 1
+  contracts_per_trade: 5
   vix_buckets:
-    13-16:
+    13-17:
       min_premium: 0.20
       rsi_upper_threshold: 50.0
       rsi_lower_threshold: 49.0
       distance:
         from_spot: 3
         from_gex_level: 1
-    16-20:
+    17-19:
       min_premium: 0.25
       rsi_upper_threshold: 55.0
       rsi_lower_threshold: 45.0
       distance:
         from_spot: 3
         from_gex_level: 1.5
-    20-25:
+    19-20:
       min_premium: 0.30
+      rsi_upper_threshold: 55.0
+      rsi_lower_threshold: 45.0
+      distance:
+        from_spot: 3
+        from_gex_level: 1.5
+    20-25:
+      min_premium: 0.35
       rsi_upper_threshold: 55.0
       rsi_lower_threshold: 45.0
       distance:
@@ -67,7 +74,7 @@ entry:
 # once >= votes_to_exit fire. All thresholds have safe code-level defaults, so the
 # engine still runs if this section is removed.
 exit:
-  votes_to_exit: 2          # number of adverse conditions required to exit
+  votes_to_exit: 3          # number of adverse conditions required to exit
   adx_floor: 20.0           # trend vote: ADX must be at/above this (real trend)
   adx_rise: 8.0             # trend vote: ADX must have risen >= this since entry
   vix1d_mult: 1.20          # vol vote: VIX1D >= entry_vix1d * this (move expanding)
