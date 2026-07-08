@@ -1683,24 +1683,35 @@ class AutoTraderEngine:
 
             now_ts = self._now().isoformat(timespec="seconds")
 
-            # ---- Pass 0: claim legs of in-flight (pending_open) orders ----
-            # A pending_open row is a real order that may already be filled at
-            # IBKR; its confirmation/rollback is owned by the pending-order
-            # poller, not this reconcile. Consume its legs so they are NOT
-            # mistaken for orphans and duplicated as a new 'open' row.
-            for pos in self.store._positions:
-                if pos.status != "pending_open":
-                    continue
-                right = "C" if pos.side == PositionSide.CALL else "P"
-                short_key = (right, float(pos.short_strike))
-                self._consume_leg(leg_map, short_key, abs(leg_map.get(short_key, 0)))
-                if pos.long_strike is not None:
-                    long_key = (right, float(pos.long_strike))
-                    self._consume_leg(leg_map, long_key, abs(leg_map.get(long_key, 0)))
+            # Snapshot the positions that are open BEFORE Pass 0 promotes any
+            # pending fills — Pass 1 reconciles only these (a just-promoted
+            # position has already had its legs consumed and must not be
+            # re-examined and wrongly expired).
+            original_open = list(self.store.get_open())
 
-            # ---- Pass 1: reconcile existing DB 'open' positions ----
             with get_conn(self.store.db_path) as conn:
-                for pos in list(self.store.get_open()):
+                # ---- Pass 0: resolve in-flight (pending_open) orders ----
+                # A pending_open row is a real order. If its legs are present at
+                # IBKR the order has FILLED, so promote it to 'open' and populate
+                # the fill (real values when the order is still queryable, best
+                # guess otherwise). Either way its legs are consumed so they are
+                # not mistaken for an orphan and duplicated as a new 'open' row.
+                # If the legs are absent we leave it pending — the pending-order
+                # poller/timeout owns the rollback.
+                for pos in [p for p in self.store._positions if p.status == "pending_open"]:
+                    right = "C" if pos.side == PositionSide.CALL else "P"
+                    short_key = (right, float(pos.short_strike))
+                    short_qty = abs(leg_map.get(short_key, 0))
+                    self._consume_leg(leg_map, short_key, short_qty)
+                    if pos.long_strike is not None:
+                        long_key = (right, float(pos.long_strike))
+                        self._consume_leg(leg_map, long_key, abs(leg_map.get(long_key, 0)))
+
+                    if short_qty > 0:
+                        self._promote_pending_fill(conn, pos, short_qty, now_ts, reason)
+
+                # ---- Pass 1: reconcile existing DB 'open' positions ----
+                for pos in original_open:
                     right = "C" if pos.side == PositionSide.CALL else "P"
                     short_key = (right, float(pos.short_strike))
                     short_signed = leg_map.get(short_key, 0)
@@ -1788,6 +1799,97 @@ class AutoTraderEngine:
             self.logger.error(
                 f"[RECONCILE:{reason}] failed: {exc}", exc_info=True
             )
+
+    def _promote_pending_fill(self, conn, pos, held_qty: int, now_ts: str, reason: str) -> None:
+        """
+        Promote a pending_open position to 'open' after IBKR confirms its legs.
+
+        A pending_open row whose legs are present at IBKR has actually filled, so
+        its status must not remain 'pending_open'. Populates fill_price/fill_time
+        with the real order values when the order is still queryable in the IBKR
+        session, otherwise a best guess:
+          - fill_price ≈ -credit (credit combos are BOUGHT at a negative limit, so
+            a filled entry marks near the negative of the collected credit),
+          - fill_time ≈ the order-submit time (fills land within seconds for 0DTE),
+            falling back to the reconcile time.
+        Syncs num_contracts to the IBKR-held lot count and drops the order from the
+        pending trackers so the poller doesn't double-handle it.
+        """
+        from trades_db import (
+            update_position_fill, update_position_num_contracts,
+        )
+        from telegram_notifier import send_telegram_message
+
+        order_id = None
+        order_time = None
+        try:
+            r = conn.execute(
+                "SELECT order_id, order_time FROM positions WHERE id = ?",
+                (pos.db_id,),
+            ).fetchone()
+            if r is not None:
+                order_id, order_time = r[0], r[1]
+        except Exception:
+            pass
+
+        fill_price = None
+        fill_time = None
+        estimated = True
+
+        # Best case: the order is still in the IBKR session → use the real fill.
+        if order_id:
+            try:
+                trade = self.client.query_order_status(int(order_id))
+            except Exception:
+                trade = None
+            if trade is not None:
+                status = getattr(getattr(trade, "orderStatus", None), "status", "")
+                if status == "Filled":
+                    avg = getattr(trade.orderStatus, "avgFillPrice", None)
+                    if avg:
+                        fill_price = float(avg)
+                        estimated = False
+                    fills = getattr(trade, "fills", None)
+                    if fills:
+                        t = getattr(getattr(fills[-1], "execution", None), "time", None)
+                        if t:
+                            fill_time = str(t)
+
+        if fill_price is None:
+            fill_price = -abs(pos.credit or 0.0)
+        if not fill_time:
+            fill_time = order_time or now_ts
+
+        update_position_fill(conn, pos.db_id, fill_price=fill_price, fill_time=fill_time)
+        if held_qty != (pos.num_contracts or 1):
+            update_position_num_contracts(conn, pos.db_id, held_qty)
+        est_note = " (fill est.)" if estimated else ""
+        conn.execute(
+            "UPDATE positions "
+            "SET status = 'open', "
+            "    notes = COALESCE(notes || ' | ', '') || ? "
+            "WHERE id = ?",
+            (f"promoted pending_open->open on reconcile{est_note}", pos.db_id),
+        )
+
+        # In-memory state + drop from pending trackers (poller must not re-handle).
+        pos.status = "open"
+        pos.num_contracts = held_qty
+        if order_id is not None:
+            self._pending_entries.pop(int(order_id), None)
+            self._pending_entry_times.pop(int(order_id), None)
+
+        self.logger.warning(
+            f"[RECONCILE:{reason}] pos_id={pos.db_id} "
+            f"{pos.side.value} {pos.short_strike:.0f}/{pos.long_strike:.0f} "
+            f"pending_open->open x{held_qty} | fill_price={fill_price:.2f} "
+            f"fill_time={fill_time}{' (est.)' if estimated else ''}"
+        )
+        send_telegram_message(
+            f"♻️ Reconcile ({reason}): confirmed fill "
+            f"{pos.side.value} {pos.short_strike:.0f}/{pos.long_strike:.0f} x{held_qty} "
+            f"-> OPEN (fill {'est. ' if estimated else ''}${fill_price:.2f})"
+        )
 
     @staticmethod
     def _consume_leg(leg_map: dict, key: tuple, qty: int) -> None:

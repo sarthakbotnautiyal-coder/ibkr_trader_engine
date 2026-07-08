@@ -91,6 +91,7 @@ def _make_engine(tmp_path: Path, ibkr_legs, dry_run: bool = False):
         client = MagicMock()
         client.is_connected.return_value = True
         client.get_open_positions_ibkr.return_value = ibkr_legs
+        client.query_order_status.return_value = None  # force best-guess fill path
         eng._client = client
 
     return eng, db, _cfg
@@ -316,15 +317,15 @@ def test_load_open_preserves_num_contracts(tmp_path):
     assert pos.num_contracts == 5
 
 
-def test_pending_open_not_duplicated_as_orphan(tmp_path):
+def test_pending_open_with_legs_promoted_to_open(tmp_path):
     """
-    Regression: a pending_open order whose legs are already at IBKR must NOT be
-    auto-created as a duplicate 'open' orphan — its fill is owned by the poller.
+    A pending_open order whose legs are present at IBKR has filled → it must be
+    promoted to 'open' (not left pending, and NOT duplicated as an orphan), with
+    a best-guess fill price/time populated.
     """
-    # One confirmed open spread + one pending_open spread, both present at IBKR.
     legs = [
         _leg("P", 7355, -5), _leg("P", 7335, +5),   # open 7355/7335
-        _leg("P", 7345, -5), _leg("P", 7325, +5),   # pending_open 7345/7325
+        _leg("P", 7345, -5), _leg("P", 7325, +5),   # pending_open 7345/7325 (filled)
     ]
     eng, db, cfg = _make_engine(tmp_path, legs)
     _add_open(eng, cfg, "PUT", 7355, 7335, credit=0.31, num_contracts=5)
@@ -335,11 +336,37 @@ def test_pending_open_not_duplicated_as_orphan(tmp_path):
 
     with get_conn(db) as conn:
         rows = conn.execute(
-            "SELECT short_strike, status FROM positions "
-            "WHERE short_strike = 7345 ORDER BY id"
+            "SELECT status, num_contracts, fill_price, fill_time, notes "
+            "FROM positions WHERE short_strike = 7345 ORDER BY id"
         ).fetchall()
-    # Exactly one 7345 row, still pending_open — no duplicate orphan.
-    assert rows == [(pytest.approx(7345), "pending_open")]
+    # Exactly one 7345 row (no duplicate), now open with fill data.
+    assert len(rows) == 1
+    status, n, fill_price, fill_time, notes = rows[0]
+    assert status == "open"
+    assert n == 5
+    assert fill_price == pytest.approx(-0.27)   # best guess: -credit
+    assert fill_time is not None
+    assert "promoted pending_open" in (notes or "")
+
+
+def test_pending_open_without_legs_stays_pending(tmp_path):
+    """
+    A pending_open order with NO legs at IBKR is still in-flight (or never
+    filled) → reconcile must leave it pending for the poller/timeout to own,
+    and must not expire or orphan it.
+    """
+    legs = []  # nothing at IBKR yet
+    eng, db, cfg = _make_engine(tmp_path, legs)
+    _add_open(eng, cfg, "PUT", 7345, 7325, credit=0.27, num_contracts=5,
+              status="pending_open")
+
+    _run_sync(eng, cfg)
+
+    with get_conn(db) as conn:
+        rows = conn.execute(
+            "SELECT status FROM positions WHERE short_strike = 7345"
+        ).fetchall()
+    assert rows == [("pending_open",)]
 
 
 def test_dry_run_is_noop(tmp_path):
