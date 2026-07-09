@@ -1,9 +1,29 @@
 #!/usr/bin/env python3
 """IBKR Trader Engine - SPX 0DTE auto-trader."""
 
+import os
 import signal
 import sys
 from pathlib import Path
+
+# Load .env BEFORE importing engine, so os.environ is populated for telegram_notifier
+def _load_env_file(env_path: Path) -> None:
+    """Load key=value pairs from env_path into os.environ."""
+    if not env_path.exists():
+        return
+    try:
+        with open(env_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    v = v.strip().strip("'\"")
+                    os.environ[k.strip()] = v
+    except Exception as e:
+        print(f"Warning: Failed to load {env_path}: {e}", file=sys.stderr)
+
+_load_env_file(Path(__file__).parent / ".env")
+_load_env_file(Path.home() / ".openclaw" / ".env")
 
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
