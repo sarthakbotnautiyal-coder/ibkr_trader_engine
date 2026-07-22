@@ -233,12 +233,6 @@ class IBKRClient:
         return self._real.get_margin_limit() if self._real else 0.0
 
 
-    def reconcile(self, store):
-        if DRY_RUN:
-            return
-        if self._real:
-            self._real.reconcile(store)
-
     # -------------------------------------------------------------------------
     # TASK-2026-179: Polling-only state sync methods
     # -------------------------------------------------------------------------

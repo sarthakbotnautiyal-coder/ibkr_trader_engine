@@ -62,7 +62,6 @@ def make_mock_blocking_client(connected: bool = True, order_id: int = 12345):
     mock_client.cancel_order.return_value = connected
     mock_client.get_buying_power.return_value = 50000.0
     mock_client.get_available_cash.return_value = 25000.0
-    mock_client.reconcile.return_value = None
 
     # TASK-2026-179: Polling methods
     mock_trade = MagicMock()
@@ -308,20 +307,6 @@ def test_get_available_cash_dry_run_returns_large_value(mock_blocking_client):
         result = client.get_available_cash()
 
     assert result == 999999.0
-
-
-# ---------------------------------------------------------------------------
-# reconcile()
-# ---------------------------------------------------------------------------
-
-def test_reconcile_calls_req_positions(mock_blocking_client):
-    """LIVE: reconcile() → _real.reconcile(mock_store)."""
-    client = make_client(mock_blocking_client, dry_run=False)
-    mock_store = MagicMock()
-    mock_store.get_open.return_value = []
-    client.reconcile(mock_store)
-
-    mock_blocking_client.reconcile.assert_called_once_with(mock_store)
 
 
 # ---------------------------------------------------------------------------
