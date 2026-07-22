@@ -15,7 +15,7 @@ from typing import Optional, TYPE_CHECKING
 
 from config import CONFIG
 from trades_db import (
-    DB_PATH, init_db, get_conn,
+    DB_PATH, init_db, open_conn,
     insert_position, update_position_status,
     update_position_exit_snapshot,
     get_open_positions, get_position_count,
@@ -285,7 +285,7 @@ class PositionStore:
         TASK-2026-179: Must load both 'open' and 'pending_open' rows so that
         in-flight entry orders are tracked for collision checking and exit signals.
         """
-        with get_conn(self.db_path) as conn:
+        with open_conn(self.db_path) as conn:
             rows = get_open_positions(conn)
             self._positions = [
                 TradePosition(
@@ -355,7 +355,7 @@ class PositionStore:
         pos.entry_macd_hist = snapshot.macd_hist
         pos.entry_vix1d     = snapshot.vix1d
 
-        with get_conn(self.db_path) as conn:
+        with open_conn(self.db_path) as conn:
             db_row = Position(
                 task_id=pos.task_id, ticker=pos.ticker,
                 side=pos.side.value, short_strike=pos.short_strike,
@@ -408,7 +408,7 @@ class PositionStore:
         Called when an entry order is rejected, cancelled, or timed out.
         Also removes from in-memory list.
         """
-        with get_conn(self.db_path) as conn:
+        with open_conn(self.db_path) as conn:
             conn.execute("DELETE FROM positions WHERE id = ?", (db_id,))
             conn.commit()
         self._positions = [p for p in self._positions if p.db_id != db_id]
@@ -443,7 +443,7 @@ class PositionStore:
         close_ts = _timestamp_et()
         snapshot = build_market_snapshot(em=em, gex_val=gex_val, combined=combined)
 
-        with get_conn(self.db_path) as conn:
+        with open_conn(self.db_path) as conn:
             update_position_status(conn, db_id, status, close_ts, pnl, notes)
             update_position_exit_snapshot(
                 conn, db_id,
@@ -465,7 +465,7 @@ class PositionStore:
         self._open_count -= 1
 
     def open_count(self) -> int:
-        with get_conn(self.db_path) as conn:
+        with open_conn(self.db_path) as conn:
             return get_position_count(conn)
 
     def get_open(self) -> list[TradePosition]:
