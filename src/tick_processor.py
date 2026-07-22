@@ -168,6 +168,7 @@ class TickProcessor:
         on_heartbeat: Optional[OnHeartbeat] = None,
         is_live: bool = True,
         debit_provider: Optional[Callable] = None,
+        quote_provider: Optional[Callable] = None,
     ):
         self._on_enter_approved = on_enter_approved
         self._on_skip = on_skip
@@ -177,6 +178,10 @@ class TickProcessor:
         # Optional callable(pos) -> Optional[float] returning the live debit-to-close
         # for the L2 premium exit vote. None (default) → premium vote is skipped.
         self._debit_provider = debit_provider
+        # Optional callable(pos) -> Optional[ComboQuote] returning the live two-sided
+        # BAG quote for the profit-take exit. None (default — dry-run/backtest) →
+        # profit-take check is skipped entirely.
+        self._quote_provider = quote_provider
 
         # Per-side anti-spam skip state: only log SKIP on reason CHANGE
         self._last_skip_reason: dict[str, Optional[str]] = {"CALL": None, "PUT": None}
@@ -306,7 +311,15 @@ class TickProcessor:
                     current_debit = self._debit_provider(pos)
                 except Exception:
                     current_debit = None
-            decision = evaluate_exit(pos, combined, current_debit=current_debit)
+            combo_quote = None
+            if self._quote_provider is not None:
+                try:
+                    combo_quote = self._quote_provider(pos)
+                except Exception:
+                    combo_quote = None
+            decision = evaluate_exit(
+                pos, combined, current_debit=current_debit, combo_quote=combo_quote
+            )
             self._on_exit_checked(
                 ts=ts,
                 pos=pos,

@@ -82,6 +82,18 @@ exit:
   rsi_call: 65.0            # momentum vote (CALL): RSI at/above this and rising
   premium_mult: 3.0         # premium vote: debit-to-close >= credit * this
 
+  # Profit-take (layer 3): buy back a decayed spread to lock in the win early.
+  # Fires only on a FRESH TWO-SIDED live quote whose marketable close cost
+  # (the bid side — what a market-order close actually pays) has stayed at/
+  # below profit_take_debit for profit_take_confirm_ticks consecutive ticks,
+  # and only before profit_take_cutoff ET — in the last hour theta finishes
+  # the decay for free, so positions ride to expiry for the full credit.
+  # Backward compat: removing these keys (or 0) disables the feature entirely.
+  profit_take_debit: 0.05         # exit when cost-to-close <= this (0 = off)
+  profit_take_cutoff: "15:00"     # inactive at/after this ET time
+  profit_take_confirm_ticks: 2    # consecutive ticks the condition must hold
+  profit_take_max_quote_age: 90   # reject quotes older than this many seconds
+
 day_gate:
   enabled: true
   window_minutes: 15

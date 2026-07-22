@@ -199,6 +199,9 @@ class AutoTraderEngine:
             is_live          =not self.dry_run,
             # Live real-trading only: feed debit-to-close into L2's premium vote.
             debit_provider   =(None if self.dry_run else self._position_debit),
+            # Live real-trading only: feed the two-sided BAG quote into the
+            # profit-take exit. None (dry-run/backtest) → check stays inert.
+            quote_provider   =(None if self.dry_run else self._position_quote),
         )
 
     @property
@@ -225,28 +228,60 @@ class AutoTraderEngine:
     # Live combo marks — L2 premium exit vote (live real-trading only)
     # -------------------------------------------------------------------------
 
-    def _position_debit(self, pos) -> Optional[float]:
-        """Return the live debit-to-close for an open spread, for L2's premium vote.
+    def _ensure_combo_sub(self, pos) -> Optional[str]:
+        """(Re)subscribe the position's BAG line and return its key, or None.
 
-        Subscribes one BAG market-data line per position on first use (idempotent),
-        then reads the streaming mark. Returns None until a quote is available, or
-        on any error — in which case L2 simply skips the premium vote and relies on
-        its indicator/price votes. Costs ~1 IBKR data line per open position.
+        Called EVERY tick, unconditionally: the client clears its ticker map on
+        reconnect (fresh IB instance kills all streaming lines), so gating this
+        on an engine-side "already subscribed" cache would leave pre-disconnect
+        positions without marks forever after any TWS reconnect. The client's
+        _subscribe_combo_impl returns early when the line already exists, so the
+        steady-state cost is one queue round-trip per open position per tick.
+        _combo_sub_keys is kept purely for _sweep_combo_subs (cancelling lines
+        of positions that are no longer open).
         """
         if self.dry_run or pos is None or pos.long_strike is None or pos.db_id is None:
             return None
+        from executor import today_expiry
+        key = str(pos.db_id)
+        right = "C" if pos.side.value == "CALL" else "P"
+        if self.client.subscribe_combo_mark(
+            key, today_expiry(), pos.short_strike, pos.long_strike, right
+        ):
+            self._combo_sub_keys.add(key)
+        return key
+
+    def _position_debit(self, pos) -> Optional[float]:
+        """Return the live debit-to-close for an open spread, for L2's premium vote.
+
+        Subscribes one BAG market-data line per position (idempotent, re-issued
+        every tick so reconnects self-heal), then reads the streaming mark.
+        Returns None until a quote is available, or on any error — in which case
+        L2 simply skips the premium vote and relies on its indicator/price votes.
+        Costs ~1 IBKR data line per open position.
+        """
         try:
-            from executor import today_expiry
-            key = str(pos.db_id)
-            right = "C" if pos.side.value == "CALL" else "P"
-            if key not in self._combo_sub_keys:
-                if self.client.subscribe_combo_mark(
-                    key, today_expiry(), pos.short_strike, pos.long_strike, right
-                ):
-                    self._combo_sub_keys.add(key)
+            key = self._ensure_combo_sub(pos)
+            if key is None:
+                return None
             return self.client.get_combo_debit(key)
         except Exception as e:
             self.logger.warning(f"_position_debit(pos={getattr(pos,'db_id',None)}) failed: {e}")
+            return None
+
+    def _position_quote(self, pos):
+        """Return the live ComboQuote for an open spread (profit-take exit input).
+
+        Same subscription line as _position_debit — no extra IBKR data lines.
+        Returns None on any failure; the profit-take check simply stays inert.
+        """
+        try:
+            key = self._ensure_combo_sub(pos)
+            if key is None:
+                return None
+            return self.client.get_combo_quote(key)
+        except Exception as e:
+            self.logger.warning(f"_position_quote(pos={getattr(pos,'db_id',None)}) failed: {e}")
             return None
 
     def _sweep_combo_subs(self) -> None:

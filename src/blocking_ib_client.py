@@ -30,11 +30,14 @@ TASK-2026-275: On Error 326 ("client id already in use") the connect path
 from __future__ import annotations
 
 import logging
+import math
 import os
 import queue
 import sys
 import threading
 import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, TypeVar
 
@@ -769,6 +772,19 @@ class BlockingIBKRClient:
             self._logger.warning(f"get_combo_debit({key}) failed: {e}")
             return None
 
+    def get_combo_quote(self, key) -> Optional["ComboQuote"]:
+        """Rich two-sided BAG quote for a subscribed position (profit-take exit
+        input), or None if no ticker / DRY_RUN / disconnected. Unlike
+        get_combo_debit this never falls back to last/close — a low-threshold
+        trigger must only act on a live two-sided market."""
+        if DRY_RUN or not self.is_connected():
+            return None
+        try:
+            return self._enqueue(_read_combo_quote_impl, self._state, str(key), timeout=5.0)
+        except Exception as e:
+            self._logger.warning(f"get_combo_quote({key}) failed: {e}")
+            return None
+
     def unsubscribe_combo_mark(self, key) -> None:
         """Cancel a position's BAG line (call on close). No-op in DRY_RUN."""
         if DRY_RUN or not self.is_connected():
@@ -849,6 +865,89 @@ def _subscribe_combo_impl(
     return True
 
 
+def _ticker_num(x) -> Optional[float]:
+    """Return x as a finite float, else None (drops None/NaN)."""
+    if x is None:
+        return None
+    if isinstance(x, float) and math.isnan(x):
+        return None
+    return float(x)
+
+
+def _ticker_side(ticker, price_attr: str, size_attr: str) -> Optional[float]:
+    """Return a ticker side's price only if backed by a real resting quote (size > 0).
+
+    Size is the discriminator: IBKR's "no quote" sentinel carries size 0/-1.
+    We deliberately do NOT reject a price of -1 here — for a $10–20 wide
+    credit spread a -1.0 combo mark is a legitimate $1.00 credit-to-close,
+    and the size gate already removes the genuine sentinels.
+    """
+    price = _ticker_num(getattr(ticker, price_attr, None))
+    size = _ticker_num(getattr(ticker, size_attr, None))
+    if price is None or size is None or size <= 0:
+        return None
+    return price
+
+
+@dataclass
+class ComboQuote:
+    """Two-sided BAG quote for one open spread — the profit-take exit's input.
+
+    Prices are SIGNED in the combo's open direction (negative = you receive
+    credit), matching how IBKR quotes the BAG (see _place_order_impl notes).
+    close_debit is what a market-order close pays RIGHT NOW: closing SELLs the
+    combo, which fills at the BID, so close_debit = max(0, -bid). It is set
+    only when BOTH sides carry real size (a live two-sided market) and the
+    value passes the [0, spread_width] sanity bound — else None. age_sec is
+    seconds since the ticker last updated (None if unknown), letting callers
+    reject stale marks from a quiet/broken data farm.
+    """
+    bid:         Optional[float] = None
+    ask:         Optional[float] = None
+    two_sided:   bool = False
+    close_debit: Optional[float] = None
+    age_sec:     Optional[float] = None
+
+
+def _read_combo_quote_impl(ib: IB, state: "_IBThreadState", key: str) -> Optional["ComboQuote"]:
+    """Build a ComboQuote from a subscribed position's ticker (IB thread).
+
+    Stricter than _read_combo_debit_impl by design: no last/close fallback,
+    close_debit only from a size-backed two-sided book. A stale-LOW mark here
+    would trigger a profit-take buy-back on garbage, so every doubtful input
+    degrades to None fields (caller skips the check — position rides as today).
+    """
+    ticker = state._combo_tickers.get(key)
+    if ticker is None:
+        return None
+
+    bid = _ticker_side(ticker, "bid", "bidSize")
+    ask = _ticker_side(ticker, "ask", "askSize")
+    two_sided = bid is not None and ask is not None
+
+    age_sec: Optional[float] = None
+    t = getattr(ticker, "time", None)
+    if t is not None:
+        try:
+            age_sec = max(0.0, (datetime.now(timezone.utc) - t).total_seconds())
+        except Exception:
+            age_sec = None
+
+    close_debit: Optional[float] = None
+    if two_sided:
+        # SELL-combo market order fills at the bid (signed negative → pay -bid).
+        # A positive bid would mean being PAID to close — clamp to 0 (free win).
+        debit = max(0.0, -bid)
+        width = state._combo_widths.get(key)
+        if width is None or width <= 0 or debit <= width + 1e-9:
+            close_debit = debit
+
+    return ComboQuote(
+        bid=bid, ask=ask, two_sided=two_sided,
+        close_debit=close_debit, age_sec=age_sec,
+    )
+
+
 def _read_combo_debit_impl(ib: IB, state: "_IBThreadState", key: str) -> Optional[float]:
     """Return current debit-to-close (abs of the BAG mark) for a subscribed position.
 
@@ -867,34 +966,14 @@ def _read_combo_debit_impl(ib: IB, state: "_IBThreadState", key: str) -> Optiona
       * Bound the result to [0, spread_width]. Anything outside that range is
         bad data → return None (skip the premium vote) rather than emit a lie.
     """
-    import math
     ticker = state._combo_tickers.get(key)
     if ticker is None:
         return None
 
-    def _num(x) -> Optional[float]:
-        if x is None:
-            return None
-        if isinstance(x, float) and math.isnan(x):
-            return None
-        return float(x)
+    _num = _ticker_num
 
-    def _side(price_attr: str, size_attr: str) -> Optional[float]:
-        """Return the price only if backed by a real resting quote (size > 0).
-
-        Size is the discriminator: IBKR's "no quote" sentinel carries size 0/-1.
-        We deliberately do NOT reject a price of -1 here — for a $10–20 wide
-        credit spread a -1.0 combo mark is a legitimate $1.00 credit-to-close,
-        and the size gate already removes the genuine sentinels.
-        """
-        price = _num(getattr(ticker, price_attr, None))
-        size = _num(getattr(ticker, size_attr, None))
-        if price is None or size is None or size <= 0:
-            return None
-        return price
-
-    bid = _side("bid", "bidSize")
-    ask = _side("ask", "askSize")
+    bid = _ticker_side(ticker, "bid", "bidSize")
+    ask = _ticker_side(ticker, "ask", "askSize")
 
     mark: Optional[float] = None
     if bid is not None and ask is not None:

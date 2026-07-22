@@ -466,6 +466,109 @@ def _exit_cfg() -> dict:
         rsi_put       = float(cfg.get("rsi_put", 35.0)),
         rsi_call      = float(cfg.get("rsi_call", 65.0)),
         premium_mult  = float(cfg.get("premium_mult", 3.0)),
+        # Profit-take (layer 3). Default 0.0 → feature OFF, so configs written
+        # before these keys existed keep today's behavior exactly (backward compat).
+        profit_take_debit         = float(cfg.get("profit_take_debit", 0.0)),
+        profit_take_cutoff        = str(cfg.get("profit_take_cutoff", "15:00")),
+        profit_take_confirm_ticks = int(cfg.get("profit_take_confirm_ticks", 2)),
+        profit_take_max_quote_age = float(cfg.get("profit_take_max_quote_age", 90.0)),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Profit-take exit (layer 3) — buy back a decayed spread to lock in the win
+# ---------------------------------------------------------------------------
+
+# Debounce state: consecutive ticks the profit-take condition has held, keyed
+# by position db_id. In-memory only — after an engine restart the streak simply
+# rebuilds (worst case the exit fires confirm_ticks-1 ticks later). Entries are
+# dropped the moment the condition breaks or the exit fires, so the dict stays
+# tiny (bounded by concurrently-open positions).
+_PT_STREAKS: dict = {}
+
+
+def reset_profit_take_state() -> None:
+    """Clear profit-take debounce state (used by tests)."""
+    _PT_STREAKS.clear()
+
+
+def _profit_take_decision(position, combo_quote, exit_regime) -> Optional["ExitDecision"]:
+    """Return an exit_layer=3 ExitDecision when the profit-take fires, else None.
+
+    Every gate below is suppress-only: any missing/doubtful input returns None
+    (position rides to expiry exactly as before this feature existed). Gates:
+      config    — exit.profit_take_debit > 0 (absent/0 → feature off)
+      cutoff    — before exit.profit_take_cutoff ET; in the last hour theta
+                  finishes the decay for free, so ride to expiry instead
+      quote     — live TWO-SIDED book only (never a last/close fallback: a
+                  stale-low mark must not trigger a buy-back)
+      freshness — ticker updated within profit_take_max_quote_age seconds
+      price     — close_debit (= what a market-order close pays, the BID side)
+                  <= profit_take_debit, so the fill lands at ~threshold
+      debounce  — condition must hold profit_take_confirm_ticks consecutive
+                  ticks so one flickering print can't fire the exit
+    """
+    cfg = _exit_cfg()
+    pt = cfg["profit_take_debit"]
+    if pt <= 0:
+        return None  # unconfigured → feature off (backward compat)
+
+    pos_id = getattr(position, "db_id", None)
+    if pos_id is None:
+        return None
+
+    def _reset() -> None:
+        _PT_STREAKS.pop(pos_id, None)
+
+    # Last-hour gate (backtest-safe via the clock override).
+    try:
+        cut_h, cut_m = _parse_hhmm(cfg["profit_take_cutoff"])
+    except Exception:
+        cut_h, cut_m = 15, 0
+    now = _now_dt()
+    if (now.hour, now.minute) >= (cut_h, cut_m):
+        _reset()
+        return None
+
+    # Quote-quality gates.
+    if combo_quote is None or not getattr(combo_quote, "two_sided", False):
+        _reset()
+        return None
+    close_debit = _num(getattr(combo_quote, "close_debit", None))
+    if close_debit is None:
+        _reset()
+        return None
+    age = _num(getattr(combo_quote, "age_sec", None))
+    if age is None or age > cfg["profit_take_max_quote_age"]:
+        _reset()
+        return None
+
+    # Price gate.
+    if close_debit > pt:
+        _reset()
+        return None
+
+    # Condition holds this tick — debounce across consecutive ticks.
+    streak = _PT_STREAKS.get(pos_id, 0) + 1
+    if streak < cfg["profit_take_confirm_ticks"]:
+        _PT_STREAKS[pos_id] = streak
+        return None
+    _reset()
+
+    credit = getattr(position, "credit", None) or 0.0
+    pct_txt = ""
+    if credit > 0:
+        pct_txt = f" (~{(credit - close_debit) / credit * 100.0:.0f}% of credit locked)"
+    return ExitDecision(
+        should_exit=True,
+        reason=(
+            f"PROFIT_TAKE | close debit {close_debit:.2f} <= {pt:.2f} "
+            f"for {streak} ticks (bid={combo_quote.bid:.2f} ask={combo_quote.ask:.2f} "
+            f"age={age:.0f}s){pct_txt}"
+        ),
+        exit_layer=3,
+        exit_conditions_met=streak,
+        exit_regime=exit_regime,
     )
 
 
@@ -473,11 +576,18 @@ def evaluate_exit(
     position,
     combined,
     current_debit: Optional[float] = None,
+    combo_quote=None,
 ) -> ExitDecision:
     """
     Momentum-aware exit logic (TASK-2026-187 → TASK-2026-199 → momentum upgrade).
 
     L1 (unchanged): SPX crosses the short strike -> EXIT (hard stop).
+
+    Profit-take (layer 3, between L1 and L2): the spread has decayed to nearly
+    worthless — buy it back to lock in the win instead of carrying strike risk
+    to expiry. Fires only from a fresh two-sided combo_quote (see
+    _profit_take_decision for the full gate list); combo_quote=None (dry-run,
+    backtest, cloud, or unconfigured) leaves behavior identical to before.
 
     L2 (adverse-condition vote): instead of waiting for price to reach the strike,
     count how many independent "market is turning against this position" conditions
@@ -532,6 +642,13 @@ def evaluate_exit(
                 near_major=False,
                 major_level=None,
             )
+
+    # --- Profit-take (layer 3): premium decayed to near-zero -> lock in the win ---
+    # Checked before L2 (a decayed spread can't also be in trouble) and WITHOUT
+    # requiring entry_em, so legacy positions lacking baselines still profit-take.
+    pt_decision = _profit_take_decision(position, combo_quote, exit_regime)
+    if pt_decision is not None:
+        return pt_decision
 
     # --- L2: adverse-condition vote ---
 
