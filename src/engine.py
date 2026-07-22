@@ -316,13 +316,13 @@ class AutoTraderEngine:
 
         This ensures the engine never loses track of pending orders across restarts.
         """
-        from trades_db import get_conn
+        from trades_db import open_conn
         import time as time_module
 
         if self.dry_run:
             return
 
-        with get_conn(self.store.db_path) as conn:
+        with open_conn(self.store.db_path) as conn:
             # Load pending entries (status='pending_open') from today
             pending_entries = conn.execute(
                 "SELECT * FROM positions WHERE status = 'pending_open' "
@@ -621,7 +621,7 @@ class AutoTraderEngine:
             self.client.cancel_order(order_id)
 
             # Update status to timeout (position stays open)
-            with get_conn() as conn:
+            with open_conn() as conn:
                 update_position_status(conn, pos_db_id, status="timeout")
                 conn.commit()
 
@@ -667,7 +667,7 @@ class AutoTraderEngine:
 
         # Update DB: pending_open → open, record fill info
         from trades_db import (
-            get_conn, update_position_status, update_position_fill,
+            open_conn, update_position_status, update_position_fill,
             update_position_num_contracts, mark_signal_filled,
         )
 
@@ -678,7 +678,7 @@ class AutoTraderEngine:
         filled_qty = int(filled) if filled else (pos.num_contracts or 1)
 
         fill_ts = self._now().isoformat(timespec="seconds")
-        with get_conn() as conn:
+        with open_conn() as conn:
             update_position_fill(conn, db_id, fill_price=avg_price, fill_time=fill_ts)
             if filled_qty != (pos.num_contracts or 1):
                 update_position_num_contracts(conn, db_id, filled_qty)
@@ -686,7 +686,7 @@ class AutoTraderEngine:
             conn.commit()
 
         # TASK-2026-208: mark the entry signal as filled now that IBKR has confirmed
-        with get_conn() as conn:
+        with open_conn() as conn:
             cur = conn.execute(
                 """SELECT id FROM signals
                    WHERE timestamp = ?
@@ -1300,8 +1300,8 @@ class AutoTraderEngine:
         if result.filled or result.status == "dry_run":
             # Edge case: order filled synchronously before place_order returned
             # (should not happen in LIVE but handle it gracefully)
-            from trades_db import get_conn, update_position_status
-            with get_conn() as conn:
+            from trades_db import open_conn, update_position_status
+            with open_conn() as conn:
                 update_position_status(conn, db_id, status="open")
                 conn.commit()
             self._log_opened(ts, decision, spx, em)
@@ -1318,8 +1318,8 @@ class AutoTraderEngine:
         # This is critical for recovery on restart — allows recovery mechanism to
         # query IBKR and determine order status. Without order_id, position becomes
         # orphaned and stuck (see _recover_pending_orders).
-        from trades_db import get_conn, update_position_order_id
-        with get_conn() as conn:
+        from trades_db import open_conn, update_position_order_id
+        with open_conn() as conn:
             update_position_order_id(
                 conn, db_id,
                 order_id=result.order_id,
@@ -1452,14 +1452,14 @@ class AutoTraderEngine:
             # Clamp DB/in-memory lot count to IBKR's actual holding so the close
             # order and the resulting exit notification use the true quantity.
             if held_qty != (pos.num_contracts or 1):
-                from trades_db import get_conn, update_position_num_contracts
+                from trades_db import open_conn, update_position_num_contracts
                 self.logger.warning(
                     f"{ts} ET [EXIT QTY SYNC] pos_id={pos.db_id} | "
                     f"{pos.side.value} {pos.short_strike:.0f}/{pos.long_strike:.0f} | "
                     f"num_contracts {pos.num_contracts} → {held_qty} (IBKR-held) "
                     f"before close"
                 )
-                with get_conn(self.store.db_path) as conn:
+                with open_conn(self.store.db_path) as conn:
                     update_position_num_contracts(conn, pos.db_id, held_qty)
                     conn.commit()
                 pos.num_contracts = held_qty
@@ -1650,7 +1650,7 @@ class AutoTraderEngine:
             from executor import today_expiry
             from position_store import TradePosition, PositionSide
             from telegram_notifier import send_telegram_message
-            from trades_db import get_conn, insert_signal, update_position_num_contracts
+            from trades_db import open_conn, insert_signal, update_position_num_contracts
 
             today = today_expiry()
             ibkr_positions = self.client.get_open_positions_ibkr()
@@ -1689,7 +1689,7 @@ class AutoTraderEngine:
             # re-examined and wrongly expired).
             original_open = list(self.store.get_open())
 
-            with get_conn(self.store.db_path) as conn:
+            with open_conn(self.store.db_path) as conn:
                 # ---- Pass 0: resolve in-flight (pending_open) orders ----
                 # A pending_open row is a real order. If its legs are present at
                 # IBKR the order has FILLED, so promote it to 'open' and populate
@@ -2002,7 +2002,7 @@ class AutoTraderEngine:
         Reaching expiry means neither L1 nor L2 triggered — the spread expired
         worthless, which is 100% profit (full credit collected, debit = 0).
         """
-        from trades_db import get_conn, get_open_positions_for_date, insert_signal
+        from trades_db import open_conn, get_open_positions_for_date, insert_signal
 
         # Use the engine clock so backtest stamps the close at the backtest
         # date's 16:00 ET (not wall-clock). isoformat() emits the correct
@@ -2013,7 +2013,7 @@ class AutoTraderEngine:
         _conn_kwargs = {"path": _db_path} if _db_path else {}
 
         try:
-            with get_conn(**_conn_kwargs) as conn:
+            with open_conn(**_conn_kwargs) as conn:
                 positions = get_open_positions_for_date(conn, trade_date)
                 if not positions:
                     return
@@ -2108,9 +2108,9 @@ class AutoTraderEngine:
         vix: Optional[float] = None,
         rsi: Optional[float] = None,
     ):
-        from trades_db import get_conn, insert_signal
+        from trades_db import open_conn, insert_signal
         try:
-            with get_conn() as conn:
+            with open_conn() as conn:
                 insert_signal(
                     conn,
                     timestamp=ts,
@@ -2141,6 +2141,7 @@ class AutoTraderEngine:
     # -------------------------------------------------------------------------
 
     def tick(self) -> Optional[str]:
+        import sqlite3
         from combined_reader import StaleDataError
 
         try:
@@ -2152,6 +2153,15 @@ class AutoTraderEngine:
             if scan:
                 ts = scan.timestamp_est
             self._log_stale(ts, str(e))
+            self._run_exit_checks_on_stale()
+            return None
+        except sqlite3.OperationalError as e:
+            # Source DB unreadable even after db_utils retries (WAL contention
+            # with an extractor writer). Unreadable == stale: skip the tick
+            # quietly, keep exit checks running, and let the next tick retry.
+            self.logger.warning(
+                f"Combined read failed, skipping tick (exit checks still run): {e}"
+            )
             self._run_exit_checks_on_stale()
             return None
 

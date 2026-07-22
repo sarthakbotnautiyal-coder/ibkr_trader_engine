@@ -12,6 +12,7 @@ TASK-2026-179: Pending-state protocol for live trading.
 """
 import sqlite3
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -177,6 +178,27 @@ def get_conn(path: Path = DB_PATH) -> sqlite3.Connection:
     raise RuntimeError(f"Failed to connect to {path} after {max_retries} retries")
 
 
+@contextmanager
+def open_conn(path: Path = DB_PATH):
+    """get_conn() as a real context manager: transaction + guaranteed close.
+
+    ``with sqlite3.connect(...)`` (and therefore ``with get_conn(...)``) only
+    commits/rolls back the transaction — it does NOT close the connection.
+    Call sites that used it leaked the connection's file descriptors
+    (db/-wal/-shm) until the cyclic GC happened to run. _record_signal leaked
+    one connection per tick this way; at 2 ticks/min the engine hit macOS's
+    default 256-fd limit in ~1 hour, after which every SQLite open in the
+    process failed with "unable to open database file" until restart
+    (incidents 2026-07-17/20/21). Use this for every scoped connection.
+    """
+    conn = get_conn(path)
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
+
+
 def init_db(path: Path = DB_PATH) -> None:
     """
     Create tables if they don't exist.
@@ -262,7 +284,7 @@ def _init_db_impl(path: Path = DB_PATH) -> None:
         ("task_id",              "TEXT"),
     ]
 
-    with get_conn(path) as conn:
+    with open_conn(path) as conn:
         conn.executescript(SCHEMA)
 
         # Migrate positions: add any new columns that don't exist yet
