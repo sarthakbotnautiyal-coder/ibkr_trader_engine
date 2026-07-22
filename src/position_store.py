@@ -295,6 +295,7 @@ class PositionStore:
                     open_time=p.open_time, credit=p.credit,
                     status=p.status, layer=p.layer,
                     notes=p.notes, db_id=p.id, entry_em=p.entry_em,
+                    num_contracts=p.num_contracts,
                     entry_spx_spot=p.entry_spx_spot,
                     entry_adx=p.entry_adx,
                     entry_rsi=p.entry_rsi,
