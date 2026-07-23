@@ -323,3 +323,51 @@ class TestReconnectResubscribe:
         pos = self._make_pos()
         with patch("executor.today_expiry", return_value="20260722"):
             assert eng._position_quote(pos) is None
+
+
+# ---------------------------------------------------------------------------
+# Executor facade delegation — regression for the 2026-07-22 live incident
+# ---------------------------------------------------------------------------
+
+class TestExecutorFacadeDelegation:
+    """executor.IBKRClient is a delegate-by-hand facade over BlockingIBKRClient.
+    get_combo_quote was added to the blocking client but the facade delegation
+    was forgotten — engine._position_quote raised AttributeError every tick in
+    live trading (2026-07-22) and the profit-take stayed inert all day. These
+    tests pin the delegation AND that the facade covers every combo-mark method
+    the engine calls on its client."""
+
+    def _facade(self, real):
+        from executor import IBKRClient
+        fc = IBKRClient.__new__(IBKRClient)  # skip __init__ (no thread spawn)
+        fc._real = real
+        fc._logger = Mock()
+        return fc
+
+    def test_get_combo_quote_delegates(self):
+        real = Mock()
+        real.get_combo_quote = Mock(return_value=_quote())
+        fc = self._facade(real)
+        with patch("executor.DRY_RUN", False):
+            q = fc.get_combo_quote("197")
+        real.get_combo_quote.assert_called_once_with("197")
+        assert q.close_debit == 0.04
+
+    def test_get_combo_quote_none_without_real_client(self):
+        fc = self._facade(None)
+        assert fc.get_combo_quote("197") is None
+
+    def test_facade_exposes_every_combo_method_engine_uses(self):
+        """The engine calls these on self.client — each must exist on the facade
+        so a future BlockingIBKRClient addition can't silently miss delegation."""
+        from executor import IBKRClient
+        for method in (
+            "subscribe_combo_mark",
+            "unsubscribe_combo_mark",
+            "get_combo_debit",
+            "get_combo_quote",
+        ):
+            assert callable(getattr(IBKRClient, method, None)), (
+                f"executor.IBKRClient facade is missing '{method}' — "
+                f"engine calls will raise AttributeError in live trading"
+            )
