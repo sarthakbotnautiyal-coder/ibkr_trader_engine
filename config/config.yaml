@@ -6,7 +6,7 @@ data_source_mode: "local"        # "local" (primary) or "cloud" (Supabase)
 
 ibkr:
   host: "127.0.0.1"
-  port: 7497        # 4001 for live, 7497 for paper
+  port: 4001        # 4001 for live, 7497 for paper
   scanner_client_id: 15
   spot_client_id: 16
   engine_client_id: 31
@@ -30,7 +30,7 @@ entry:
   spread_width_primary: 10
   spread_width_fallback: 20
   short_delta_target: 0.03
-  contracts_per_trade: 5
+  contracts_per_trade: 1
   vix_buckets:
     13-17:
       min_premium: 0.20
@@ -81,6 +81,18 @@ exit:
   rsi_put: 35.0             # momentum vote (PUT): RSI at/below this and falling
   rsi_call: 65.0            # momentum vote (CALL): RSI at/above this and rising
   premium_mult: 3.0         # premium vote: debit-to-close >= credit * this
+
+  # Profit-take (layer 3): buy back a decayed spread to lock in the win early.
+  # Fires only on a FRESH TWO-SIDED live quote whose marketable close cost
+  # (the bid side — what a market-order close actually pays) has stayed at/
+  # below profit_take_debit for profit_take_confirm_ticks consecutive ticks,
+  # and only before profit_take_cutoff ET — in the last hour theta finishes
+  # the decay for free, so positions ride to expiry for the full credit.
+  # Backward compat: removing these keys (or 0) disables the feature entirely.
+  profit_take_debit: 0.05         # exit when cost-to-close <= this (0 = off)
+  profit_take_cutoff: "15:00"     # inactive at/after this ET time
+  profit_take_confirm_ticks: 2    # consecutive ticks the condition must hold
+  profit_take_max_quote_age: 90   # reject quotes older than this many seconds
 
 day_gate:
   enabled: true

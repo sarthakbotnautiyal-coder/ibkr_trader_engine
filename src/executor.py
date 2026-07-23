@@ -183,6 +183,15 @@ class IBKRClient:
             return None
         return self._real.get_combo_debit(key)
 
+    def get_combo_quote(self, key):
+        """Rich two-sided BAG quote (profit-take exit input). Found missing in
+        live logs 2026-07-22: engine._position_quote hit AttributeError every
+        tick because this facade delegation was omitted when the method was
+        added to BlockingIBKRClient — the profit-take stayed inert all day."""
+        if DRY_RUN or self._real is None:
+            return None
+        return self._real.get_combo_quote(key)
+
     def unsubscribe_combo_mark(self, key) -> None:
         if DRY_RUN or self._real is None:
             return
